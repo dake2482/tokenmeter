@@ -1,0 +1,38 @@
+# macOS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Runtime and dependency folders
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+node_modules/
+
+# Secrets and local machine config
+.env
+.env.*
+*.env
+!*.env.example
+*.pem
+*.key
+*.cert
+
+# Local service output
+logs/
+tmp/
+outputs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Local/generated analysis exports
+docs/hermes_stock_analysis_*/
