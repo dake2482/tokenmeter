@@ -84,6 +84,48 @@ def upsert_records(db_path: Path | str, records: list[UsageRecord]) -> int:
         return conn.total_changes - before
 
 
+def delete_legacy_codex_records(db_path: Path | str) -> int:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        before = conn.total_changes
+        conn.execute(
+            """
+            delete from usage_records
+            where agent = 'codex'
+              and record_id not like 'codex:%:%'
+            """
+        )
+        return conn.total_changes - before
+
+
+def delete_legacy_openclaw_records(db_path: Path | str) -> int:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        before = conn.total_changes
+        conn.execute(
+            """
+            delete from usage_records
+            where agent = 'openclaw'
+              and record_id not like 'openclaw:v2:%'
+            """
+        )
+        return conn.total_changes - before
+
+
+def delete_zero_token_records(db_path: Path | str) -> int:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        before = conn.total_changes
+        conn.execute(
+            """
+            delete from usage_records
+            where input_tokens + output_tokens + cache_read_tokens
+                + cache_write_tokens + reasoning_tokens <= 0
+            """
+        )
+        return conn.total_changes - before
+
+
 def load_records(db_path: Path | str, since: str | None = None) -> list[UsageRecord]:
     init_db(db_path)
     since_epoch = parse_since(since)

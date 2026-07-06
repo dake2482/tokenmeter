@@ -11,7 +11,13 @@ from urllib import request
 
 from .collectors import collect_all, parse_since
 from .server import run_server
-from .storage import summarize_db, upsert_records
+from .storage import (
+    delete_legacy_codex_records,
+    delete_legacy_openclaw_records,
+    delete_zero_token_records,
+    summarize_db,
+    upsert_records,
+)
 from .summary import DEFAULT_GROUP_BY, format_table, summarize_records
 
 
@@ -61,7 +67,11 @@ def _add_collect_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--home", default=str(Path.home()), help="home directory to scan")
     parser.add_argument("--host", default=socket.gethostname())
     parser.add_argument("--since", default="7d", help="relative window such as 24h, 7d, 4w, all")
-    parser.add_argument("--agents", default="hermes,openclaw", help="comma-separated: hermes,openclaw")
+    parser.add_argument(
+        "--agents",
+        default="hermes,openclaw,codex,zcode,workbuddy,claude",
+        help="comma-separated: hermes,openclaw,codex,zcode,workbuddy,claude",
+    )
 
 
 def _cmd_collect(args: argparse.Namespace) -> int:
@@ -106,8 +116,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 def _cmd_import(args: argparse.Namespace) -> int:
     records = _collect_from_args(args)
+    agents = {record.agent for record in records}
+    cleaned = delete_zero_token_records(args.db)
+    if "codex" in agents:
+        cleaned += delete_legacy_codex_records(args.db)
+    if "openclaw" in agents:
+        cleaned += delete_legacy_openclaw_records(args.db)
     changed = upsert_records(args.db, records)
-    print(f"stored {len(records)} records ({changed} changed) in {args.db}")
+    print(f"stored {len(records)} records ({changed + cleaned} changed, {cleaned} legacy cleaned) in {args.db}")
     return 0
 
 
@@ -136,4 +152,3 @@ def _parse_bind(value: str) -> tuple[str, int]:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
