@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import socket
+import io
+import tarfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +20,15 @@ from .storage import (
     summarize_db,
     upsert_records,
 )
+
+APP_PREFIX = "/tokenmeter"
+ASSET_DIR = Path(__file__).resolve().parents[2] / "assets"
+ASSET_CONTENT_TYPES = {
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".svg": "image/svg+xml; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
+}
 
 
 def run_server(
@@ -103,13 +114,27 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/", "/index.html"}:
+        path = _strip_app_prefix(parsed.path)
+        if path in {"/", "/index.html"}:
             self._html(DASHBOARD_HTML)
             return
-        if parsed.path == "/health":
+        if path == "/site.webmanifest":
+            self._manifest(_manifest_payload())
+            return
+        asset_name = _asset_name_for_path(path)
+        if asset_name:
+            self._asset(asset_name)
+            return
+        if path == "/install.sh":
+            self._text(_install_script(self._public_base_url()))
+            return
+        if path == "/tokenmeter.tar.gz":
+            self._bytes(_source_tarball(), "application/gzip")
+            return
+        if path == "/health":
             self._json({"ok": True})
             return
-        if parsed.path == "/api/v1/summary":
+        if path == "/api/v1/summary":
             if not self._authorized():
                 return
             query = parse_qs(parsed.query)
@@ -119,7 +144,7 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
             rows = summarize_db(self.database_path, since=since, group_by=group_by)
             self._json({"rows": rows})
             return
-        if parsed.path == "/api/v1/daily":
+        if path == "/api/v1/daily":
             if not self._authorized():
                 return
             query = parse_qs(parsed.query)
@@ -133,7 +158,8 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/api/v1/usage":
+        path = _strip_app_prefix(parsed.path)
+        if path != "/api/v1/usage":
             self.send_error(404)
             return
         if not self._authorized():
@@ -188,12 +214,353 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             return
 
+    def _text(self, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            return
+
+    def _manifest(self, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", ASSET_CONTENT_TYPES[".webmanifest"])
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            return
+
+    def _asset(self, name: str) -> None:
+        path = ASSET_DIR / name
+        if not path.is_file():
+            self.send_error(404)
+            return
+        self._bytes(path.read_bytes(), _content_type(path.name), cache_seconds=300)
+
+    def _bytes(self, body: bytes, content_type: str, cache_seconds: int | None = None) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if cache_seconds is not None:
+            self.send_header("Cache-Control", f"public, max-age={cache_seconds}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            return
+
+    def _public_base_url(self) -> str:
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "127.0.0.1:18888"
+        proto = self.headers.get("X-Forwarded-Proto") or "http"
+        return f"{proto}://{host}".rstrip("/")
+
+
+def _strip_app_prefix(path: str) -> str:
+    if path == APP_PREFIX:
+        return "/"
+    if path.startswith(f"{APP_PREFIX}/"):
+        stripped = path[len(APP_PREFIX):]
+        return stripped or "/"
+    return path
+
+
+def _asset_name_for_path(path: str) -> str | None:
+    aliases = {
+        "/favicon.ico": "favicon-t.ico",
+        "/favicon.svg": "tokenmeter-t-icon.svg",
+        "/apple-touch-icon.png": "apple-touch-icon-t.png",
+    }
+    if path in aliases:
+        return aliases[path]
+    if not path.startswith("/assets/"):
+        return None
+    name = path.removeprefix("/assets/")
+    if not name or "/" in name or name.startswith("."):
+        return None
+    return name
+
+
+def _content_type(name: str) -> str:
+    return ASSET_CONTENT_TYPES.get(Path(name).suffix.lower(), "application/octet-stream")
+
+
+def _manifest_payload() -> dict:
+    return {
+        "name": "TokenMeter",
+        "short_name": "TokenMeter",
+        "description": "多服务器 Agent token 用量统计看板",
+        "start_url": APP_PREFIX,
+        "scope": f"{APP_PREFIX}/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#0f172a",
+        "icons": [
+            {
+                "src": f"{APP_PREFIX}/assets/tokenmeter-t-icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any maskable",
+            },
+            {
+                "src": f"{APP_PREFIX}/assets/tokenmeter-t-icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable",
+            },
+        ],
+    }
+
+
+def _source_tarball() -> bytes:
+    root = Path(__file__).resolve().parents[2]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for rel in ("pyproject.toml", "README.md", "docs/tokenmeter.md", "assets", "src", "tests"):
+            path = root / rel
+            if path.exists():
+                tar.add(path, arcname=f"tokenmeter/{rel}", filter=_tar_filter)
+    return buf.getvalue()
+
+
+def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    parts = Path(info.name).parts
+    ignored = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+    if any(part in ignored for part in parts):
+        return None
+    if any(part.startswith("._") or part.startswith(".__") for part in parts):
+        return None
+    if info.name.endswith((".pyc", ".pyo")):
+        return None
+    return info
+
+
+def _install_script(public_base_url: str) -> str:
+    upload_base = public_base_url
+    download_base = f"{public_base_url}/tokenmeter"
+    return f"""#!/bin/sh
+set -eu
+
+TOKENMETER_SERVER="${{1:-{upload_base}}}"
+TOKENMETER_DOWNLOAD_BASE="${{2:-{download_base}}}"
+TOKENMETER_HOST="${{TOKENMETER_HOST:-$(hostname)}}"
+TOKENMETER_INTERVAL="${{TOKENMETER_INTERVAL:-900}}"
+TOKENMETER_SINCE="${{TOKENMETER_SINCE:-1d}}"
+TOKENMETER_BOOTSTRAP_SINCE="${{TOKENMETER_BOOTSTRAP_SINCE:-30d}}"
+TOKENMETER_AGENTS="${{TOKENMETER_AGENTS:-hermes,openclaw,codex,zcode,workbuddy,claude}}"
+TOKENMETER_HOME="${{TOKENMETER_HOME:-$HOME}}"
+TOKENMETER_TOKEN="${{TOKENMETER_TOKEN:-}}"
+
+need_cmd() {{
+  command -v "$1" >/dev/null 2>&1 || {{ echo "缺少命令: $1" >&2; exit 1; }}
+}}
+
+need_cmd curl
+need_cmd tar
+
+PYTHON_BIN="${{TOKENMETER_PYTHON:-}}"
+if [ -z "$PYTHON_BIN" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    echo "缺少 python3" >&2
+    exit 1
+  fi
+fi
+
+OS="$(uname -s)"
+if [ "$(id -u)" = "0" ] && [ "$OS" = "Linux" ]; then
+  INSTALL_DIR="${{TOKENMETER_DIR:-/opt/tokenmeter}}"
+else
+  INSTALL_DIR="${{TOKENMETER_DIR:-$HOME/.local/share/tokenmeter}}"
+fi
+
+TMP_DIR="$(mktemp -d)"
+cleanup() {{ rm -rf "$TMP_DIR"; }}
+trap cleanup EXIT
+
+echo "▸ 下载 TokenMeter..."
+curl -fsSL "$TOKENMETER_DOWNLOAD_BASE/tokenmeter.tar.gz" -o "$TMP_DIR/tokenmeter.tar.gz"
+tar -xzf "$TMP_DIR/tokenmeter.tar.gz" -C "$TMP_DIR"
+mkdir -p "$(dirname "$INSTALL_DIR")"
+rm -rf "$INSTALL_DIR"
+mv "$TMP_DIR/tokenmeter" "$INSTALL_DIR"
+
+RUNNER="$INSTALL_DIR/tokenmeter-upload.sh"
+cat > "$RUNNER" <<EOF_RUNNER
+#!/bin/sh
+set -eu
+TOKENMETER_DIR="$INSTALL_DIR"
+TOKENMETER_PYTHON="$PYTHON_BIN"
+TOKENMETER_SERVER="\\${{TOKENMETER_SERVER:-$TOKENMETER_SERVER}}"
+TOKENMETER_HOST="\\${{TOKENMETER_HOST:-$TOKENMETER_HOST}}"
+TOKENMETER_SINCE="\\${{TOKENMETER_SINCE:-$TOKENMETER_SINCE}}"
+TOKENMETER_HOME="\\${{TOKENMETER_HOME:-$TOKENMETER_HOME}}"
+TOKENMETER_AGENTS="\\${{TOKENMETER_AGENTS:-$TOKENMETER_AGENTS}}"
+TOKENMETER_TOKEN="\\${{TOKENMETER_TOKEN:-$TOKENMETER_TOKEN}}"
+cd "\\$TOKENMETER_DIR"
+set -- "\\$TOKENMETER_PYTHON" -m tokenmeter upload --server "\\$TOKENMETER_SERVER" --host "\\$TOKENMETER_HOST" --since "\\$TOKENMETER_SINCE" --home "\\$TOKENMETER_HOME" --agents "\\$TOKENMETER_AGENTS"
+if [ -n "\\$TOKENMETER_TOKEN" ]; then
+  set -- "\\$@" --token "\\$TOKENMETER_TOKEN"
+fi
+PYTHONPATH="\\$TOKENMETER_DIR/src" exec "\\$@"
+EOF_RUNNER
+chmod +x "$RUNNER"
+
+PYTHONPATH="$INSTALL_DIR/src" "$PYTHON_BIN" -m tokenmeter --help >/dev/null
+
+install_systemd_root() {{
+  ENV_FILE="/etc/tokenmeter-upload.env"
+  cat > "$ENV_FILE" <<EOF_ENV
+TOKENMETER_SERVER=$TOKENMETER_SERVER
+TOKENMETER_HOST=$TOKENMETER_HOST
+TOKENMETER_SINCE=$TOKENMETER_SINCE
+TOKENMETER_HOME=$TOKENMETER_HOME
+TOKENMETER_AGENTS=$TOKENMETER_AGENTS
+TOKENMETER_TOKEN=$TOKENMETER_TOKEN
+EOF_ENV
+  chmod 600 "$ENV_FILE"
+  cat > /etc/systemd/system/tokenmeter-upload.service <<EOF_SERVICE
+[Unit]
+Description=Upload local token usage to TokenMeter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=$ENV_FILE
+ExecStart=$RUNNER
+EOF_SERVICE
+  cat > /etc/systemd/system/tokenmeter-upload.timer <<EOF_TIMER
+[Unit]
+Description=Upload local token usage to TokenMeter every $TOKENMETER_INTERVAL seconds
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${{TOKENMETER_INTERVAL}}s
+Persistent=true
+Unit=tokenmeter-upload.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  systemctl daemon-reload
+  systemctl enable --now tokenmeter-upload.timer
+  systemctl start tokenmeter-upload.service || true
+}}
+
+install_systemd_user() {{
+  USER_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$USER_DIR"
+  cat > "$USER_DIR/tokenmeter-upload.service" <<EOF_SERVICE
+[Unit]
+Description=Upload local token usage to TokenMeter
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=TOKENMETER_SERVER=$TOKENMETER_SERVER
+Environment=TOKENMETER_HOST=$TOKENMETER_HOST
+Environment=TOKENMETER_SINCE=$TOKENMETER_SINCE
+Environment=TOKENMETER_HOME=$TOKENMETER_HOME
+Environment=TOKENMETER_AGENTS=$TOKENMETER_AGENTS
+Environment=TOKENMETER_TOKEN=$TOKENMETER_TOKEN
+ExecStart=$RUNNER
+EOF_SERVICE
+  cat > "$USER_DIR/tokenmeter-upload.timer" <<EOF_TIMER
+[Unit]
+Description=Upload local token usage to TokenMeter every $TOKENMETER_INTERVAL seconds
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${{TOKENMETER_INTERVAL}}s
+Persistent=true
+Unit=tokenmeter-upload.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  systemctl --user daemon-reload
+  systemctl --user enable --now tokenmeter-upload.timer
+  systemctl --user start tokenmeter-upload.service || true
+}}
+
+install_launchd() {{
+  PLIST="$HOME/Library/LaunchAgents/com.dake.tokenmeter-upload.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  cat > "$PLIST" <<EOF_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.dake.tokenmeter-upload</string>
+  <key>ProgramArguments</key>
+  <array><string>$RUNNER</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TOKENMETER_SERVER</key><string>$TOKENMETER_SERVER</string>
+    <key>TOKENMETER_HOST</key><string>$TOKENMETER_HOST</string>
+    <key>TOKENMETER_SINCE</key><string>$TOKENMETER_SINCE</string>
+    <key>TOKENMETER_HOME</key><string>$TOKENMETER_HOME</string>
+    <key>TOKENMETER_AGENTS</key><string>$TOKENMETER_AGENTS</string>
+    <key>TOKENMETER_TOKEN</key><string>$TOKENMETER_TOKEN</string>
+  </dict>
+  <key>StartInterval</key><integer>$TOKENMETER_INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/tokenmeter-upload.out.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/tokenmeter-upload.err.log</string>
+</dict>
+</plist>
+EOF_PLIST
+  launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  launchctl kickstart -k "gui/$(id -u)/com.dake.tokenmeter-upload" || true
+}}
+
+echo "▸ 首次上传最近 $TOKENMETER_BOOTSTRAP_SINCE 数据..."
+TOKENMETER_SINCE="$TOKENMETER_BOOTSTRAP_SINCE" "$RUNNER" || true
+
+if [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
+  if [ "$(id -u)" = "0" ]; then
+    install_systemd_root
+    echo "✓ 已安装 systemd timer: tokenmeter-upload.timer"
+  else
+    install_systemd_user
+    echo "✓ 已安装 user systemd timer: tokenmeter-upload.timer"
+  fi
+elif [ "$OS" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
+  install_launchd
+  echo "✓ 已安装 launchd: com.dake.tokenmeter-upload"
+else
+  echo "已安装到 $INSTALL_DIR，但当前系统没有可用的 systemd/launchd。"
+  echo "请手动定时运行: $RUNNER"
+fi
+
+echo ""
+echo "✓ 完成。页面: $TOKENMETER_SERVER/tokenmeter"
+echo "上传命令: $RUNNER"
+"""
+
 
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="application-name" content="TokenMeter">
+  <meta name="apple-mobile-web-app-title" content="TokenMeter">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0f172a">
+  <link rel="manifest" href="/tokenmeter/site.webmanifest">
+  <link rel="icon" href="/tokenmeter/assets/favicon-t.ico" sizes="any">
+  <link rel="icon" href="/tokenmeter/assets/tokenmeter-t-icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/tokenmeter/assets/apple-touch-icon-t.png" sizes="180x180">
   <title>TokenMeter</title>
   <style>
     :root {
@@ -819,6 +1186,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
 
     <section class="panel rank-panel">
+      <h2 id="hostRankTitle" class="section-title">今日按服务器</h2>
+      <div id="hostRanks" class="rank-list"></div>
+      <button id="toggleHosts" class="show-all" type="button">展开全部服务器</button>
+    </section>
+
+    <section class="panel rank-panel">
       <h2 id="profileRankTitle" class="section-title">今日按 Profile</h2>
       <div id="profileRanks" class="rank-list"></div>
       <button id="toggleProfiles" class="show-all" type="button">展开全部 Profile</button>
@@ -858,6 +1231,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       "Other": "var(--other)"
     };
     const MODEL_COLORS = ["#7e5cf1", "#2f64e6", "#f59e0b", "#1397ad", "#e3262b", "#1ca34a", "#7c8797"];
+    const HOST_COLORS = ["#1397ad", "#2f64e6", "#732ed8", "#db7956", "#1ca34a", "#f59e0b", "#7c8797"];
     const tokenInput = document.getElementById("tokenInput");
     const authPanel = document.getElementById("authPanel");
     const statusEl = document.getElementById("status");
@@ -868,6 +1242,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       chartDays: [],
       toolExpanded: false,
       modelExpanded: false,
+      hostExpanded: false,
       profileExpanded: false,
       selectedAgent: "all",
       selectedRange: "today",
@@ -918,6 +1293,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     function profileName(value) {
       const text = String(value || "").trim();
       return text && text.toLowerCase() !== "unknown" ? text : "default";
+    }
+
+    function hostName(value) {
+      const text = String(value || "").trim();
+      return text && text.toLowerCase() !== "unknown" ? text : "未知服务器";
     }
 
     function shouldSplitProfile(baseTool) {
@@ -1086,6 +1466,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const days = allDays.slice(startIndex, endIndex + 1);
       const dateSet = new Set(days);
       const toolRows = (data.dailyByTool || []).filter(row => dateSet.has(row.date) && agentMatches(row));
+      const hostRows = (data.dailyByHost || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const agentModelRows = (data.dailyByAgentModel || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const modelRows = state.selectedAgent === "all"
         ? (data.dailyByModel || []).filter(row => dateSet.has(row.date))
@@ -1093,7 +1474,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const tools = state.selectedAgent === "all"
         ? actualToolsFromRows(toolRows)
         : [state.selectedAgent];
-      return {option, days, dateSet, toolRows, modelRows, tools};
+      return {option, days, dateSet, toolRows, hostRows, modelRows, tools};
     }
 
     function formatDateRange(context) {
@@ -1134,6 +1515,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       document.getElementById("syncText").textContent = "最近同步 刚刚";
       document.getElementById("toolRankTitle").textContent = `${context.option.title}按工具`;
       document.getElementById("modelRankTitle").textContent = `${context.option.title}按模型`;
+      document.getElementById("hostRankTitle").textContent = `${context.option.title}按服务器`;
       document.getElementById("profileRankTitle").textContent = `${context.option.title}按 Profile`;
     }
 
@@ -1240,6 +1622,19 @@ DASHBOARD_HTML = r"""<!doctype html>
       updateToggle("toggleModels", state.modelExpanded, modelRanks.ranked.length, "模型");
     }
 
+    function renderHostRanks(context) {
+      const hostRanks = buildRankRows(
+        context.hostRows,
+        row => hostName(row.host),
+        (_row, index) => HOST_COLORS[index % HOST_COLORS.length]
+      );
+      const hostLimit = state.hostExpanded || hostRanks.ranked.length <= RANK_COLLAPSE_THRESHOLD
+        ? hostRanks.ranked.length
+        : RANK_COLLAPSE_THRESHOLD;
+      document.getElementById("hostRanks").innerHTML = rankRows(hostRanks, hostLimit);
+      updateToggle("toggleHosts", state.hostExpanded, hostRanks.ranked.length, "服务器");
+    }
+
     function renderProfileRanks(context) {
       const profileRows = context.toolRows.filter(row => shouldSplitProfile(toolName(row.agent)));
       const profileRanks = buildRankRows(
@@ -1301,6 +1696,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderTop(context);
       renderShare(context);
       renderRanks(context);
+      renderHostRanks(context);
       renderProfileRanks(context);
       renderHistoryDetails(data);
     }
@@ -1318,6 +1714,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           state.selectedAgent = button.dataset.agent;
           state.toolExpanded = false;
           state.modelExpanded = false;
+          state.hostExpanded = false;
           state.profileExpanded = false;
           if (state.data) renderDashboard(state.data);
         }
@@ -1329,12 +1726,14 @@ DASHBOARD_HTML = r"""<!doctype html>
         state.chartEndIndex = null;
         state.toolExpanded = false;
         state.modelExpanded = false;
+        state.hostExpanded = false;
         state.profileExpanded = false;
         if (state.data) renderDashboard(state.data);
       });
 
       const toolButton = document.getElementById("toggleTools");
       const modelButton = document.getElementById("toggleModels");
+      const hostButton = document.getElementById("toggleHosts");
       const profileButton = document.getElementById("toggleProfiles");
       toolButton.addEventListener("click", () => {
         state.toolExpanded = !state.toolExpanded;
@@ -1342,6 +1741,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       });
       modelButton.addEventListener("click", () => {
         state.modelExpanded = !state.modelExpanded;
+        if (state.data) renderDashboard(state.data);
+      });
+      hostButton.addEventListener("click", () => {
+        state.hostExpanded = !state.hostExpanded;
         if (state.data) renderDashboard(state.data);
       });
       profileButton.addEventListener("click", () => {
@@ -1384,15 +1787,17 @@ DASHBOARD_HTML = r"""<!doctype html>
     async function refresh() {
       setStatus("加载中...");
       try {
-        const [dailyByTool, dailyByModel, dailyByAgentModel] = await Promise.all([
+        const [dailyByTool, dailyByModel, dailyByAgentModel, dailyByHost] = await Promise.all([
           api("/api/v1/daily?since=all&group_by=agent,profile"),
           api("/api/v1/daily?since=all&group_by=model"),
-          api("/api/v1/daily?since=all&group_by=agent,profile,model")
+          api("/api/v1/daily?since=all&group_by=agent,profile,model"),
+          api("/api/v1/daily?since=all&group_by=host,agent")
         ]);
         const data = {
           dailyByTool: dailyByTool.rows || [],
           dailyByModel: dailyByModel.rows || [],
-          dailyByAgentModel: dailyByAgentModel.rows || []
+          dailyByAgentModel: dailyByAgentModel.rows || [],
+          dailyByHost: dailyByHost.rows || []
         };
         state.data = data;
         renderDashboard(data);

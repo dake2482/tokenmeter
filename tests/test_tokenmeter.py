@@ -10,6 +10,7 @@ from pathlib import Path
 from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
 from tokenmeter.records import UsageRecord
+from tokenmeter.server import _asset_name_for_path, _manifest_payload, _strip_app_prefix
 from tokenmeter.storage import daily_summary_db, upsert_records
 from tokenmeter.summary import summarize_records
 
@@ -145,6 +146,18 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].total_tokens, 3000)
         self.assertEqual(records[0].timestamp, 2000)
+
+    def test_web_app_icon_paths_support_tokenmeter_prefix(self) -> None:
+        self.assertEqual(_strip_app_prefix("/tokenmeter"), "/")
+        self.assertEqual(_strip_app_prefix("/tokenmeter/assets/tokenmeter-t-icon.svg"), "/assets/tokenmeter-t-icon.svg")
+        self.assertEqual(_asset_name_for_path("/favicon.svg"), "tokenmeter-t-icon.svg")
+        self.assertEqual(_asset_name_for_path("/assets/apple-touch-icon-t.png"), "apple-touch-icon-t.png")
+
+        manifest = _manifest_payload()
+
+        self.assertEqual(manifest["start_url"], "/tokenmeter")
+        self.assertEqual(manifest["scope"], "/tokenmeter/")
+        self.assertIn("/tokenmeter/assets/tokenmeter-t-icon-512.png", {icon["src"] for icon in manifest["icons"]})
 
 
 def _usage_record(record_id: str, model: str, tokens: int) -> UsageRecord:

@@ -22,6 +22,7 @@ TokenMeter 只读取 Token 统计相关字段，不读取 Hermes 消息正文、
 - 支持中心 SQLite 存储，方便单机部署和备份。
 - 支持 Web 页面查看今日、昨日、近 3 天、近 7 天、近 30 天。
 - 支持真实 SVG 占比图，鼠标悬停可查看具体 token 和占比。
+- 支持 favicon、Apple Touch Icon 和 Web App Manifest，保存到桌面时会显示专用图标。
 - 支持简单 Bearer Token 保护 API。
 
 ## 快速开始
@@ -109,6 +110,35 @@ TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter upload \
 ```
 
 建议后续用 systemd timer、cron 或 macOS LaunchAgent 定时执行 `tokenmeter upload`。
+
+## 一键安装上传器
+
+其他机器只需要执行下面这条命令，就会安装本机上传器、立即上传最近 30 天数据，并创建每 15 分钟上传最近 1 天数据的定时任务：
+
+```sh
+curl -fsSL http://your-tokenmeter.example.com/tokenmeter/install.sh | sh
+```
+
+如果目标机器需要 root 权限安装 systemd timer，可以使用：
+
+```sh
+curl -fsSL http://your-tokenmeter.example.com/tokenmeter/install.sh | sudo sh
+```
+
+默认中心地址是 `http://your-tokenmeter.example.com`。也可以显式指定：
+
+```sh
+curl -fsSL http://your-tokenmeter.example.com/tokenmeter/install.sh | sh -s -- "http://your-tokenmeter.example.com"
+```
+
+常用环境变量：
+
+- `TOKENMETER_HOST`: 覆盖上报主机名，默认 `hostname`。
+- `TOKENMETER_INTERVAL`: 定时上传间隔秒数，默认 `900`。
+- `TOKENMETER_BOOTSTRAP_SINCE`: 首次上传窗口，默认 `30d`。
+- `TOKENMETER_SINCE`: 后续定时上传窗口，默认 `1d`。
+- `TOKENMETER_AGENTS`: 采集 Agent 列表，默认 `hermes,openclaw,codex,zcode,workbuddy,claude`。
+- `TOKENMETER_TOKEN`: 如果中心服务启用了 Bearer Token，在这里填写。
 
 ## 常用命令
 
