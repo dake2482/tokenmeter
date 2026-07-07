@@ -149,15 +149,15 @@ class TokenMeterTests(unittest.TestCase):
 
     def test_web_app_icon_paths_support_tokenmeter_prefix(self) -> None:
         self.assertEqual(_strip_app_prefix("/tokenmeter"), "/")
-        self.assertEqual(_strip_app_prefix("/tokenmeter/assets/tokenmeter-t-icon.svg"), "/assets/tokenmeter-t-icon.svg")
-        self.assertEqual(_asset_name_for_path("/favicon.svg"), "tokenmeter-t-icon.svg")
-        self.assertEqual(_asset_name_for_path("/assets/apple-touch-icon-t.png"), "apple-touch-icon-t.png")
+        self.assertEqual(_strip_app_prefix("/tokenmeter/assets/tokenmeter-plain-t-icon.svg"), "/assets/tokenmeter-plain-t-icon.svg")
+        self.assertEqual(_asset_name_for_path("/favicon.svg"), "tokenmeter-plain-t-icon.svg")
+        self.assertEqual(_asset_name_for_path("/assets/apple-touch-icon-plain-t.png"), "apple-touch-icon-plain-t.png")
 
         manifest = _manifest_payload()
 
         self.assertEqual(manifest["start_url"], "/tokenmeter")
         self.assertEqual(manifest["scope"], "/tokenmeter/")
-        self.assertIn("/tokenmeter/assets/tokenmeter-t-icon-512.png", {icon["src"] for icon in manifest["icons"]})
+        self.assertIn("/tokenmeter/assets/tokenmeter-plain-t-icon-512.png", {icon["src"] for icon in manifest["icons"]})
 
 
 def _usage_record(record_id: str, model: str, tokens: int) -> UsageRecord:

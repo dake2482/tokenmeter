@@ -273,9 +273,9 @@ def _strip_app_prefix(path: str) -> str:
 
 def _asset_name_for_path(path: str) -> str | None:
     aliases = {
-        "/favicon.ico": "favicon-t.ico",
-        "/favicon.svg": "tokenmeter-t-icon.svg",
-        "/apple-touch-icon.png": "apple-touch-icon-t.png",
+        "/favicon.ico": "favicon-plain-t.ico",
+        "/favicon.svg": "tokenmeter-plain-t-icon.svg",
+        "/apple-touch-icon.png": "apple-touch-icon-plain-t.png",
     }
     if path in aliases:
         return aliases[path]
@@ -303,13 +303,13 @@ def _manifest_payload() -> dict:
         "theme_color": "#0f172a",
         "icons": [
             {
-                "src": f"{APP_PREFIX}/assets/tokenmeter-t-icon-192.png",
+                "src": f"{APP_PREFIX}/assets/tokenmeter-plain-t-icon-192.png",
                 "sizes": "192x192",
                 "type": "image/png",
                 "purpose": "any maskable",
             },
             {
-                "src": f"{APP_PREFIX}/assets/tokenmeter-t-icon-512.png",
+                "src": f"{APP_PREFIX}/assets/tokenmeter-plain-t-icon-512.png",
                 "sizes": "512x512",
                 "type": "image/png",
                 "purpose": "any maskable",
@@ -558,9 +558,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#0f172a">
   <link rel="manifest" href="/tokenmeter/site.webmanifest">
-  <link rel="icon" href="/tokenmeter/assets/favicon-t.ico" sizes="any">
-  <link rel="icon" href="/tokenmeter/assets/tokenmeter-t-icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/tokenmeter/assets/apple-touch-icon-t.png" sizes="180x180">
+  <link rel="icon" href="/tokenmeter/assets/favicon-plain-t.ico" sizes="any">
+  <link rel="icon" href="/tokenmeter/assets/tokenmeter-plain-t-icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/tokenmeter/assets/apple-touch-icon-plain-t.png" sizes="180x180">
   <title>TokenMeter</title>
   <style>
     :root {
@@ -737,18 +737,19 @@ DASHBOARD_HTML = r"""<!doctype html>
       border-radius: 50%;
       background: #ffffff;
       text-align: center;
+      pointer-events: none;
     }
     .pie-total {
       max-width: 100%;
-      color: var(--text);
-      font-size: 30px;
+      color: #050812;
+      font-size: 20px;
       line-height: 1.05;
       font-weight: 900;
       white-space: nowrap;
     }
     .pie-label {
       margin-top: 8px;
-      color: var(--muted);
+      color: #111827;
       font-size: 13px;
       font-weight: 800;
     }
@@ -778,9 +779,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .share-value {
-      color: #687184;
+      color: #111827;
       text-align: right;
       white-space: nowrap;
+      font-weight: 800;
     }
     .legend {
       display: flex;
@@ -1044,7 +1046,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       .share-head { align-items: flex-start; flex-direction: column; }
       .share-layout { grid-template-columns: 1fr; gap: 28px; }
       .pie-wrap { width: min(220px, 76vw); }
-      .pie-total { font-size: 26px; }
+      .pie-total { font-size: 20px; }
       .share-row { grid-template-columns: 1fr; gap: 10px; font-size: 18px; }
       .share-value { text-align: left; }
       .chart-wrap { grid-template-columns: 54px 1fr; min-height: 330px; }
@@ -1068,7 +1070,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       .metric-grid { gap: 10px; margin-bottom: 16px; }
       .metric-card { min-height: 92px; padding: 18px 14px 14px; }
       .metric-value { font-size: 30px; }
-      .pie-total { font-size: 24px; }
+      .pie-total { font-size: 19px; }
       .section-title { font-size: 19px; }
       .filters {
         overflow: hidden;
@@ -1107,7 +1109,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     @media (max-width: 360px) {
       .today-number { font-size: 30px; }
       .metric-value { font-size: 28px; }
-      .pie-total { font-size: 22px; }
+      .pie-total { font-size: 18px; }
       .today-panel, .usage-panel, .rank-panel, .detail-panel { padding-right: 12px; padding-left: 12px; }
       .chart-wrap { grid-template-columns: 42px 1fr; }
       .axis { font-size: 13px; }
@@ -1166,17 +1168,11 @@ DASHBOARD_HTML = r"""<!doctype html>
           <svg id="sharePie" class="pie-chart" viewBox="0 0 100 100" role="img" aria-labelledby="shareTitle"></svg>
           <div class="pie-center">
             <div id="shareTotal" class="pie-total">--</div>
-            <div class="pie-label">总用量</div>
+            <div id="shareLabel" class="pie-label">总用量</div>
           </div>
         </div>
         <div id="shareList" class="share-list"></div>
       </div>
-    </section>
-
-    <section id="by-tool" class="panel rank-panel">
-      <h2 id="toolRankTitle" class="section-title">今日按工具</h2>
-      <div id="toolRanks" class="rank-list"></div>
-      <button id="toggleTools" class="show-all" type="button">展开全部工具</button>
     </section>
 
     <section class="panel rank-panel">
@@ -1240,7 +1236,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       chartWindow: 30,
       chartEndIndex: null,
       chartDays: [],
-      toolExpanded: false,
       modelExpanded: false,
       hostExpanded: false,
       profileExpanded: false,
@@ -1513,7 +1508,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       document.getElementById("totalCost").textContent = money(cost);
       document.getElementById("activeDays").textContent = activeDays.toLocaleString("en-US");
       document.getElementById("syncText").textContent = "最近同步 刚刚";
-      document.getElementById("toolRankTitle").textContent = `${context.option.title}按工具`;
       document.getElementById("modelRankTitle").textContent = `${context.option.title}按模型`;
       document.getElementById("hostRankTitle").textContent = `${context.option.title}按服务器`;
       document.getElementById("profileRankTitle").textContent = `${context.option.title}按 Profile`;
@@ -1528,11 +1522,19 @@ DASHBOARD_HTML = r"""<!doctype html>
       const total = rankData.total;
       const rows = rankData.ranked;
       const pie = document.getElementById("sharePie");
+      const shareTotalEl = document.getElementById("shareTotal");
+      const shareLabelEl = document.getElementById("shareLabel");
+      const resetShareCenter = () => {
+        shareTotalEl.textContent = compactTokens(total, 1);
+        shareLabelEl.textContent = "总用量";
+      };
       document.getElementById("shareTitle").textContent = `${context.option.title}用量占比`;
       document.getElementById("shareDate").textContent = formatDateRange(context);
-      document.getElementById("shareTotal").textContent = compactTokens(total, 1);
+      resetShareCenter();
       if (!rows.length || !total) {
         pie.innerHTML = `<circle cx="50" cy="50" r="36" fill="none" stroke="var(--track)" stroke-width="28"><title>暂无数据</title></circle>`;
+        shareTotalEl.textContent = "--";
+        shareLabelEl.textContent = "暂无数据";
         document.getElementById("shareList").innerHTML = `<div class="share-row"><div>暂无数据</div><div class="bar-track"></div><div class="share-value">--</div></div>`;
         return;
       }
@@ -1541,7 +1543,9 @@ DASHBOARD_HTML = r"""<!doctype html>
       pie.innerHTML = rows.map((row, index) => {
         const pct = row.total_tokens / total * 100;
         const dash = rows.length === 1 ? 100 : Math.max(0, pct - 0.35);
-        const label = `${row.name} ${compactTokens(row.total_tokens, 2)} · ${percent(row.total_tokens, total)}`;
+        const value = compactTokens(row.total_tokens, 2);
+        const pctText = percent(row.total_tokens, total);
+        const label = `${row.name} ${value} · ${pctText}`;
         const html = `
           <circle class="pie-slice"
             cx="50" cy="50" r="36" fill="none"
@@ -1550,13 +1554,28 @@ DASHBOARD_HTML = r"""<!doctype html>
             stroke-dasharray="${dash} ${100 - dash}"
             stroke-dashoffset="${-offset}"
             pathLength="100"
-            transform="rotate(-90 50 50)">
+            transform="rotate(-90 50 50)"
+            tabindex="0"
+            aria-label="${escapeHtml(label)}"
+            data-name="${escapeHtml(row.name)}"
+            data-value="${escapeHtml(value)}"
+            data-percent="${escapeHtml(pctText)}">
             <title>${escapeHtml(label)}</title>
           </circle>
         `;
         offset += pct;
         return html;
       }).join("");
+      pie.querySelectorAll(".pie-slice").forEach(slice => {
+        const showSlice = () => {
+          shareTotalEl.textContent = slice.dataset.value || "--";
+          shareLabelEl.textContent = `${slice.dataset.name || "用量"} · ${slice.dataset.percent || ""}`.trim();
+        };
+        slice.addEventListener("mouseenter", showSlice);
+        slice.addEventListener("mouseleave", resetShareCenter);
+        slice.addEventListener("focus", showSlice);
+        slice.addEventListener("blur", resetShareCenter);
+      });
       document.getElementById("shareList").innerHTML = rows.slice(0, 8).map((row, index) => {
         const pct = percent(row.total_tokens, total);
         const value = compactTokens(row.total_tokens, 2);
@@ -1600,25 +1619,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     function renderRanks(context) {
-      const toolRanks = buildRankRows(
-        context.toolRows,
-        row => toolName(row.agent),
-        row => colorFor(row.name)
-      );
       const modelRanks = buildRankRows(
         context.modelRows,
         row => modelName(row.model),
         (_row, index) => MODEL_COLORS[index % MODEL_COLORS.length]
       );
-      const toolLimit = state.toolExpanded || toolRanks.ranked.length <= RANK_COLLAPSE_THRESHOLD
-        ? toolRanks.ranked.length
-        : RANK_COLLAPSE_THRESHOLD;
       const modelLimit = state.modelExpanded || modelRanks.ranked.length <= RANK_COLLAPSE_THRESHOLD
         ? modelRanks.ranked.length
         : RANK_COLLAPSE_THRESHOLD;
-      document.getElementById("toolRanks").innerHTML = rankRows(toolRanks, toolLimit);
       document.getElementById("modelRanks").innerHTML = rankRows(modelRanks, modelLimit);
-      updateToggle("toggleTools", state.toolExpanded, toolRanks.ranked.length, "工具");
       updateToggle("toggleModels", state.modelExpanded, modelRanks.ranked.length, "模型");
     }
 
@@ -1712,7 +1721,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         }
         if (button.dataset.agent) {
           state.selectedAgent = button.dataset.agent;
-          state.toolExpanded = false;
           state.modelExpanded = false;
           state.hostExpanded = false;
           state.profileExpanded = false;
@@ -1724,21 +1732,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         if (!button) return;
         state.selectedRange = button.dataset.range;
         state.chartEndIndex = null;
-        state.toolExpanded = false;
         state.modelExpanded = false;
         state.hostExpanded = false;
         state.profileExpanded = false;
         if (state.data) renderDashboard(state.data);
       });
 
-      const toolButton = document.getElementById("toggleTools");
       const modelButton = document.getElementById("toggleModels");
       const hostButton = document.getElementById("toggleHosts");
       const profileButton = document.getElementById("toggleProfiles");
-      toolButton.addEventListener("click", () => {
-        state.toolExpanded = !state.toolExpanded;
-        if (state.data) renderDashboard(state.data);
-      });
       modelButton.addEventListener("click", () => {
         state.modelExpanded = !state.modelExpanded;
         if (state.data) renderDashboard(state.data);
