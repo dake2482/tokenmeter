@@ -10,7 +10,7 @@ from pathlib import Path
 from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
 from tokenmeter.records import UsageRecord
-from tokenmeter.server import _asset_name_for_path, _manifest_payload, _strip_app_prefix
+from tokenmeter.server import _asset_name_for_path, _dashboard_payload, _manifest_payload, _strip_app_prefix
 from tokenmeter.storage import daily_summary_db, upsert_records
 from tokenmeter.summary import summarize_records
 
@@ -97,6 +97,40 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(by_agent["hermes"]["date"], "1970-01-01")
         self.assertEqual(by_agent["hermes"]["total_tokens"], 23)
         self.assertEqual(by_agent["openclaw"]["total_tokens"], 17)
+
+    def test_daily_summary_normalizes_legacy_model_names_after_sql_grouping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "tokenmeter.sqlite"
+            upsert_records(
+                db_path,
+                [
+                    _usage_record("a", "glm5.2", 10),
+                    _usage_record("b", "GLM-5.2", 20),
+                ],
+            )
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("update usage_records set model = 'glm5.2' where record_id = 'a'")
+
+            rows = daily_summary_db(db_path, since="all", group_by=("model",))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "GLM-5.2")
+        self.assertEqual(rows[0]["total_tokens"], 30)
+
+    def test_dashboard_payload_combines_home_page_series(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _make_hermes_db(home / ".hermes" / "state.db", "s-default", 1000, 20)
+            _make_openclaw_jsonl(home / ".openclaw" / "agents" / "main" / "sessions" / "run.trajectory.jsonl")
+            db_path = home / "tokenmeter.sqlite"
+            upsert_records(db_path, collect_all(home=home, host="test-host", since=0))
+
+            payload = _dashboard_payload(db_path, since="all")
+
+        self.assertEqual(set(payload), {"dailyByTool", "dailyByModel", "dailyByAgentModel", "dailyByHost"})
+        self.assertTrue(payload["dailyByTool"])
+        self.assertTrue(payload["dailyByModel"])
+        self.assertTrue(payload["dailyByHost"])
 
     def test_openclaw_duplicate_seq_events_have_distinct_record_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

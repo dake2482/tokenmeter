@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 
 from .collectors import parse_since
-from .records import UsageRecord
+from .records import UsageRecord, normalize_model_name
 from .summary import summarize_records
+
+GROUP_BY_COLUMNS = {"host", "agent", "profile", "source", "provider", "model"}
+TOKEN_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
 
 
 def init_db(db_path: Path | str) -> None:
@@ -153,7 +161,8 @@ def summarize_db(
     group_by: tuple[str, ...] | None = None,
 ) -> list[dict[str, object]]:
     records = load_records(db_path, since=since)
-    return summarize_records(records, group_by or ("host", "agent", "profile", "source", "provider", "model"))
+    dims = _validate_group_by(group_by, ("host", "agent", "profile", "source", "provider", "model"))
+    return summarize_records(records, dims)
 
 
 def daily_summary_db(
@@ -161,19 +170,63 @@ def daily_summary_db(
     since: str | None = None,
     group_by: tuple[str, ...] | None = None,
 ) -> list[dict[str, object]]:
-    records = load_records(db_path, since=since)
-    dims = group_by or ("agent",)
+    init_db(db_path)
+    dims = _validate_group_by(group_by, ("agent",))
+    since_epoch = parse_since(since)
+    where = "where timestamp >= ?" if since_epoch is not None else ""
+    params = (since_epoch,) if since_epoch is not None else ()
+    dim_select = "".join(f", {name}" for name in dims)
+    dim_group = "".join(f", {name}" for name in dims)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            select
+                date(timestamp, 'unixepoch', 'localtime') as usage_date
+                {dim_select},
+                count(*) as records,
+                count(distinct session_id) as sessions,
+                sum(input_tokens) as input_tokens,
+                sum(output_tokens) as output_tokens,
+                sum(cache_read_tokens) as cache_read_tokens,
+                sum(cache_write_tokens) as cache_write_tokens,
+                sum(reasoning_tokens) as reasoning_tokens,
+                sum(input_tokens + output_tokens + cache_read_tokens
+                    + cache_write_tokens + reasoning_tokens) as total_tokens,
+                coalesce(sum(estimated_cost_usd), 0.0) as estimated_cost_usd
+            from usage_records
+            {where}
+            group by usage_date{dim_group}
+            order by usage_date desc, total_tokens desc
+            """,
+            params,
+        ).fetchall()
+
+    return _merge_daily_rows(rows, dims)
+
+
+def _validate_group_by(group_by: tuple[str, ...] | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    dims = group_by or default
+    invalid = [name for name in dims if name not in GROUP_BY_COLUMNS]
+    if invalid:
+        raise ValueError(f"unsupported group_by column: {', '.join(invalid)}")
+    return dims
+
+
+def _merge_daily_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[dict[str, object]]:
     buckets: dict[tuple[object, ...], dict[str, object]] = {}
-    for record in records:
-        date = datetime.fromtimestamp(record.timestamp).date().isoformat()
-        key = (date, *(getattr(record, name) for name in dims))
+    for sql_row in rows:
+        date = str(sql_row["usage_date"] or "")
+        values = tuple(_normalize_group_value(name, sql_row[name]) for name in dims)
+        key = (date, *values)
         if key not in buckets:
             row = {"date": date}
             row.update({name: value for name, value in zip(dims, key[1:])})
             row.update(
                 {
                     "records": 0,
-                    "sessions": set(),
+                    "sessions": 0,
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "cache_read_tokens": 0,
@@ -185,20 +238,19 @@ def daily_summary_db(
             )
             buckets[key] = row
         bucket = buckets[key]
-        bucket["records"] = int(bucket["records"]) + 1
-        bucket["sessions"].add(record.session_id)
-        bucket["input_tokens"] = int(bucket["input_tokens"]) + record.input_tokens
-        bucket["output_tokens"] = int(bucket["output_tokens"]) + record.output_tokens
-        bucket["cache_read_tokens"] = int(bucket["cache_read_tokens"]) + record.cache_read_tokens
-        bucket["cache_write_tokens"] = int(bucket["cache_write_tokens"]) + record.cache_write_tokens
-        bucket["reasoning_tokens"] = int(bucket["reasoning_tokens"]) + record.reasoning_tokens
-        bucket["total_tokens"] = int(bucket["total_tokens"]) + record.total_tokens
-        if record.estimated_cost_usd:
-            bucket["estimated_cost_usd"] = float(bucket["estimated_cost_usd"]) + record.estimated_cost_usd
+        bucket["records"] = int(bucket["records"]) + int(sql_row["records"] or 0)
+        bucket["sessions"] = int(bucket["sessions"]) + int(sql_row["sessions"] or 0)
+        for column in TOKEN_COLUMNS:
+            bucket[column] = int(bucket[column]) + int(sql_row[column] or 0)
+        bucket["total_tokens"] = int(bucket["total_tokens"]) + int(sql_row["total_tokens"] or 0)
+        bucket["estimated_cost_usd"] = float(bucket["estimated_cost_usd"]) + float(sql_row["estimated_cost_usd"] or 0)
 
-    rows = []
-    for row in buckets.values():
-        row["sessions"] = len(row["sessions"])
-        rows.append(row)
+    rows = list(buckets.values())
     rows.sort(key=lambda row: (str(row["date"]), int(row["total_tokens"])), reverse=True)
     return rows
+
+
+def _normalize_group_value(name: str, value: object) -> str:
+    if name == "model":
+        return normalize_model_name(value)
+    return str(value or "")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import socket
 import io
@@ -29,6 +30,27 @@ ASSET_CONTENT_TYPES = {
     ".svg": "image/svg+xml; charset=utf-8",
     ".webmanifest": "application/manifest+json; charset=utf-8",
 }
+DASHBOARD_GROUPS = {
+    "dailyByTool": ("agent", "profile"),
+    "dailyByModel": ("model",),
+    "dailyByAgentModel": ("agent", "profile", "model"),
+    "dailyByHost": ("host", "agent"),
+}
+DASHBOARD_BASE_GROUP = ("host", "agent", "profile", "model")
+DASHBOARD_CACHE_TTL_SECONDS = 30.0
+DASHBOARD_NUMBER_COLUMNS = (
+    "records",
+    "sessions",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+    "estimated_cost_usd",
+)
+_DASHBOARD_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_DASHBOARD_CACHE_LOCK = threading.Lock()
 
 
 def run_server(
@@ -98,6 +120,8 @@ def _auto_import_loop(
             if "openclaw" in agent_names:
                 cleaned += delete_legacy_openclaw_records(db_path)
             changed = upsert_records(db_path, records)
+            if changed or cleaned:
+                _clear_dashboard_cache()
             elapsed = time.time() - started
             print(
                 f"auto import stored {len(records)} records "
@@ -144,6 +168,13 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
             rows = summarize_db(self.database_path, since=since, group_by=group_by)
             self._json({"rows": rows})
             return
+        if path == "/api/v1/dashboard":
+            if not self._authorized():
+                return
+            query = parse_qs(parsed.query)
+            since = query.get("since", ["all"])[0]
+            self._json(_cached_dashboard_payload(self.database_path, since=since))
+            return
         if path == "/api/v1/daily":
             if not self._authorized():
                 return
@@ -171,6 +202,8 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
             self.send_error(400, f"invalid payload: {exc}")
             return
         changed = upsert_records(self.database_path, records)
+        if changed:
+            _clear_dashboard_cache()
         self._json({"ok": True, "records": len(records), "changed": changed})
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -194,48 +227,19 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
 
     def _json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except BrokenPipeError:
-            return
+        self._send_body(body, "application/json; charset=utf-8", status=status)
 
     def _html(self, html: str) -> None:
         body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except BrokenPipeError:
-            return
+        self._send_body(body, "text/html; charset=utf-8")
 
     def _text(self, text: str) -> None:
         body = text.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except BrokenPipeError:
-            return
+        self._send_body(body, "text/plain; charset=utf-8")
 
     def _manifest(self, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", ASSET_CONTENT_TYPES[".webmanifest"])
-        self.send_header("Cache-Control", "public, max-age=3600")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except BrokenPipeError:
-            return
+        self._send_body(body, ASSET_CONTENT_TYPES[".webmanifest"], cache_seconds=3600)
 
     def _asset(self, name: str) -> None:
         path = ASSET_DIR / name
@@ -245,16 +249,45 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         self._bytes(path.read_bytes(), _content_type(path.name), cache_seconds=300)
 
     def _bytes(self, body: bytes, content_type: str, cache_seconds: int | None = None) -> None:
-        self.send_response(200)
+        self._send_body(body, content_type, cache_seconds=cache_seconds)
+
+    def _send_body(
+        self,
+        body: bytes,
+        content_type: str,
+        status: int = 200,
+        cache_seconds: int | None = None,
+    ) -> None:
+        compressed = self._maybe_gzip(body, content_type)
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         if cache_seconds is not None:
             self.send_header("Cache-Control", f"public, max-age={cache_seconds}")
+        if compressed is not body:
+            body = compressed
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
             self.wfile.write(body)
         except BrokenPipeError:
             return
+
+    def _maybe_gzip(self, body: bytes, content_type: str) -> bytes:
+        if len(body) < 1024:
+            return body
+        if "gzip" not in self.headers.get("Accept-Encoding", "").lower():
+            return body
+        compressible = (
+            content_type.startswith("text/")
+            or content_type.startswith("application/json")
+            or content_type.startswith("application/manifest")
+            or content_type.startswith("image/svg")
+        )
+        if not compressible:
+            return body
+        return gzip.compress(body)
 
     def _public_base_url(self) -> str:
         host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "127.0.0.1:18888"
@@ -316,6 +349,51 @@ def _manifest_payload() -> dict:
             },
         ],
     }
+
+
+def _dashboard_payload(db_path: Path, since: str | None = "all") -> dict:
+    base_rows = daily_summary_db(db_path, since=since, group_by=DASHBOARD_BASE_GROUP)
+    return {
+        name: _rollup_daily_rows(base_rows, group_by)
+        for name, group_by in DASHBOARD_GROUPS.items()
+    }
+
+
+def _cached_dashboard_payload(db_path: Path, since: str | None = "all") -> dict:
+    key = (str(db_path), since or "")
+    now = time.time()
+    with _DASHBOARD_CACHE_LOCK:
+        cached = _DASHBOARD_CACHE.get(key)
+        if cached and now - cached[0] <= DASHBOARD_CACHE_TTL_SECONDS:
+            return cached[1]
+    payload = _dashboard_payload(db_path, since=since)
+    with _DASHBOARD_CACHE_LOCK:
+        _DASHBOARD_CACHE[key] = (time.time(), payload)
+    return payload
+
+
+def _clear_dashboard_cache() -> None:
+    with _DASHBOARD_CACHE_LOCK:
+        _DASHBOARD_CACHE.clear()
+
+
+def _rollup_daily_rows(rows: list[dict[str, object]], group_by: tuple[str, ...]) -> list[dict[str, object]]:
+    buckets: dict[tuple[object, ...], dict[str, object]] = {}
+    for source in rows:
+        key = (source.get("date"), *(source.get(name) or "" for name in group_by))
+        if key not in buckets:
+            row = {"date": source.get("date")}
+            row.update({name: value for name, value in zip(group_by, key[1:])})
+            row.update({name: 0.0 if name == "estimated_cost_usd" else 0 for name in DASHBOARD_NUMBER_COLUMNS})
+            buckets[key] = row
+        bucket = buckets[key]
+        for name in DASHBOARD_NUMBER_COLUMNS:
+            current = float(bucket[name]) if name == "estimated_cost_usd" else int(bucket[name])
+            value = float(source.get(name) or 0) if name == "estimated_cost_usd" else int(source.get(name) or 0)
+            bucket[name] = current + value
+    result = list(buckets.values())
+    result.sort(key=lambda row: (str(row["date"]), int(row["total_tokens"])), reverse=True)
+    return result
 
 
 def _source_tarball() -> bytes:
@@ -1789,17 +1867,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     async function refresh() {
       setStatus("加载中...");
       try {
-        const [dailyByTool, dailyByModel, dailyByAgentModel, dailyByHost] = await Promise.all([
-          api("/api/v1/daily?since=all&group_by=agent,profile"),
-          api("/api/v1/daily?since=all&group_by=model"),
-          api("/api/v1/daily?since=all&group_by=agent,profile,model"),
-          api("/api/v1/daily?since=all&group_by=host,agent")
-        ]);
+        const payload = await api("/api/v1/dashboard?since=all");
         const data = {
-          dailyByTool: dailyByTool.rows || [],
-          dailyByModel: dailyByModel.rows || [],
-          dailyByAgentModel: dailyByAgentModel.rows || [],
-          dailyByHost: dailyByHost.rows || []
+          dailyByTool: payload.dailyByTool || [],
+          dailyByModel: payload.dailyByModel || [],
+          dailyByAgentModel: payload.dailyByAgentModel || [],
+          dailyByHost: payload.dailyByHost || []
         };
         state.data = data;
         renderDashboard(data);
