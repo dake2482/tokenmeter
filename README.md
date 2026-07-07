@@ -48,6 +48,17 @@ PYTHONPATH=src python3 -m tokenmeter serve \
   --db data/tokenmeter.sqlite
 ```
 
+`serve` 默认会立即采集一次本机数据，之后每 15 分钟自动采集最近 1 天的数据并写入中心库。页面会每 60 秒自动刷新 API 数据。
+
+如需关闭服务内自动采集：
+
+```sh
+PYTHONPATH=src python3 -m tokenmeter serve \
+  --bind 127.0.0.1:18888 \
+  --db data/tokenmeter.sqlite \
+  --auto-import-interval 0
+```
+
 然后打开：
 
 ```text
@@ -76,6 +87,16 @@ http://<服务器 IP>:18888/
 TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter serve \
   --bind 0.0.0.0:18888 \
   --db /var/lib/tokenmeter/tokenmeter.sqlite
+```
+
+中心服务器也可以调整自动采集间隔，例如每 15 分钟：
+
+```sh
+TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter serve \
+  --bind 0.0.0.0:18888 \
+  --db /var/lib/tokenmeter/tokenmeter.sqlite \
+  --auto-import-interval 15m \
+  --auto-import-since 1d
 ```
 
 其他服务器上传数据：

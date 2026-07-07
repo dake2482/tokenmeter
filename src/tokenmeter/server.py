@@ -1,22 +1,100 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .collectors import collect_all, parse_since
 from .records import UsageRecord
-from .storage import daily_summary_db, summarize_db, upsert_records
+from .storage import (
+    daily_summary_db,
+    delete_legacy_codex_records,
+    delete_legacy_openclaw_records,
+    delete_zero_token_records,
+    summarize_db,
+    upsert_records,
+)
 
 
-def run_server(host: str, port: int, db_path: Path, token: str | None = None) -> None:
+def run_server(
+    host: str,
+    port: int,
+    db_path: Path,
+    token: str | None = None,
+    auto_import_interval_seconds: float | None = None,
+    auto_import_since: str = "1d",
+    auto_import_home: Path | None = None,
+    auto_import_host: str | None = None,
+    auto_import_agents: tuple[str, ...] | None = None,
+) -> None:
     class Handler(TokenMeterHandler):
         server_token = token
         database_path = db_path
 
     httpd = ThreadingHTTPServer((host, port), Handler)
+    stop_event: threading.Event | None = None
+    worker: threading.Thread | None = None
+    if auto_import_interval_seconds and auto_import_interval_seconds > 0:
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=_auto_import_loop,
+            args=(
+                stop_event,
+                db_path,
+                auto_import_interval_seconds,
+                auto_import_since,
+                auto_import_home,
+                auto_import_host or socket.gethostname(),
+                auto_import_agents,
+            ),
+            name="tokenmeter-auto-import",
+            daemon=True,
+        )
+        worker.start()
+        print(f"auto import enabled every {auto_import_interval_seconds:g}s since={auto_import_since}")
     print(f"tokenmeter listening on http://{host}:{port}")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        if stop_event:
+            stop_event.set()
+        if worker:
+            worker.join(timeout=2)
+
+
+def _auto_import_loop(
+    stop_event: threading.Event,
+    db_path: Path,
+    interval_seconds: float,
+    since_text: str,
+    home: Path | None,
+    host: str,
+    agents: tuple[str, ...] | None,
+) -> None:
+    while not stop_event.is_set():
+        started = time.time()
+        try:
+            since = parse_since(since_text)
+            records = collect_all(home=home, host=host, since=since, agents=agents)
+            cleaned = delete_zero_token_records(db_path)
+            agent_names = {record.agent for record in records}
+            if "codex" in agent_names:
+                cleaned += delete_legacy_codex_records(db_path)
+            if "openclaw" in agent_names:
+                cleaned += delete_legacy_openclaw_records(db_path)
+            changed = upsert_records(db_path, records)
+            elapsed = time.time() - started
+            print(
+                f"auto import stored {len(records)} records "
+                f"({changed + cleaned} changed, {cleaned} cleaned) in {elapsed:.1f}s"
+            )
+        except Exception as exc:
+            print(f"auto import failed: {exc}")
+        stop_event.wait(interval_seconds)
 
 
 class TokenMeterHandler(BaseHTTPRequestHandler):
@@ -195,7 +273,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       margin-bottom: 14px;
     }
     .today-number {
-      font-size: clamp(34px, 4.2vw, 44px);
+      font-size: 44px;
       line-height: 1;
       font-weight: 900;
       white-space: nowrap;
@@ -234,7 +312,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       min-width: 0;
     }
     .metric-value {
-      font-size: clamp(28px, 3.5vw, 36px);
+      font-size: 36px;
       line-height: 1.05;
       font-weight: 900;
       margin-bottom: 6px;
@@ -296,7 +374,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .pie-total {
       max-width: 100%;
       color: var(--text);
-      font-size: clamp(22px, 2.6vw, 30px);
+      font-size: 30px;
       line-height: 1.05;
       font-weight: 900;
       white-space: nowrap;
@@ -599,6 +677,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       .share-head { align-items: flex-start; flex-direction: column; }
       .share-layout { grid-template-columns: 1fr; gap: 28px; }
       .pie-wrap { width: min(220px, 76vw); }
+      .pie-total { font-size: 26px; }
       .share-row { grid-template-columns: 1fr; gap: 10px; font-size: 18px; }
       .share-value { text-align: left; }
       .chart-wrap { grid-template-columns: 54px 1fr; min-height: 330px; }
@@ -612,14 +691,60 @@ DASHBOARD_HTML = r"""<!doctype html>
       th { font-size: 13px; }
     }
     @media (max-width: 560px) {
-      .page { width: calc(100% - 20px); }
+      html, body { overflow-x: hidden; }
+      .page { width: 100%; padding: 10px 10px 24px; }
       .today-head { align-items: flex-start; flex-direction: column; }
+      .today-panel, .usage-panel, .rank-panel, .detail-panel {
+        padding: 18px 14px;
+        border-radius: 12px;
+      }
+      .metric-grid { gap: 10px; margin-bottom: 16px; }
+      .metric-card { min-height: 92px; padding: 18px 14px 14px; }
       .metric-value { font-size: 30px; }
+      .pie-total { font-size: 24px; }
+      .section-title { font-size: 19px; }
+      .filters {
+        overflow: hidden;
+        margin-bottom: 16px;
+      }
+      .filter-row {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        margin: 0 -10px;
+        padding: 0 10px 4px;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+      }
+      .filter-row::-webkit-scrollbar { display: none; }
+      .filter-chip {
+        flex: 0 0 auto;
+        min-height: 36px;
+        padding: 0 14px;
+        font-size: 16px;
+      }
+      .share-layout { gap: 18px; }
+      .share-row { font-size: 16px; }
+      .chart-wrap { grid-template-columns: 46px 1fr; min-height: 286px; }
+      .chart { padding-right: 0; }
+      .axis { padding-right: 8px; font-size: 14px; }
+      .chart-dates { font-size: 15px; }
+      .bars { gap: 2px; min-height: 240px; }
       .bar { min-width: 9px; }
       .rank-row { grid-template-columns: 1fr; }
+      .rank-row > div:first-child { overflow-wrap: anywhere; }
       .rank-value { text-align: left; }
       .auth-panel { align-items: stretch; flex-direction: column; }
-      table { min-width: 520px; }
+      .detail-panel { overflow: hidden; }
+      table { min-width: 560px; }
+    }
+    @media (max-width: 360px) {
+      .today-number { font-size: 30px; }
+      .metric-value { font-size: 28px; }
+      .pie-total { font-size: 22px; }
+      .today-panel, .usage-panel, .rank-panel, .detail-panel { padding-right: 12px; padding-left: 12px; }
+      .chart-wrap { grid-template-columns: 42px 1fr; }
+      .axis { font-size: 13px; }
+      .bar { min-width: 8px; }
     }
   </style>
 </head>
@@ -693,6 +818,12 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button id="toggleModels" class="show-all" type="button">展开全部模型</button>
     </section>
 
+    <section class="panel rank-panel">
+      <h2 id="profileRankTitle" class="section-title">今日按 Profile</h2>
+      <div id="profileRanks" class="rank-list"></div>
+      <button id="toggleProfiles" class="show-all" type="button">展开全部 Profile</button>
+    </section>
+
     <section class="panel detail-panel">
       <h2 class="section-title">历史明细</h2>
       <div class="table-scroll">
@@ -706,6 +837,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <script>
     const KNOWN_TOOLS = ["OpenClaw", "Codex", "Hermes", "Claude Code", "Cursor", "WorkBuddy", "ZCode", "Gemini"];
+    const RANK_COLLAPSE_THRESHOLD = 10;
     const RANGE_OPTIONS = [
       {id: "today", label: "今天", title: "今日", days: 1, offset: 0},
       {id: "yesterday", label: "昨天", title: "昨日", days: 1, offset: 1},
@@ -736,6 +868,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       chartDays: [],
       toolExpanded: false,
       modelExpanded: false,
+      profileExpanded: false,
       selectedAgent: "all",
       selectedRange: "today",
       agentExpanded: false
@@ -782,11 +915,38 @@ DASHBOARD_HTML = r"""<!doctype html>
       return text.slice(0, 1).toUpperCase() + text.slice(1);
     }
 
+    function profileName(value) {
+      const text = String(value || "").trim();
+      return text && text.toLowerCase() !== "unknown" ? text : "default";
+    }
+
+    function shouldSplitProfile(baseTool) {
+      return baseTool === "OpenClaw" || baseTool === "Hermes";
+    }
+
+    function profileLabel(row) {
+      const base = toolName(row?.agent);
+      if (!shouldSplitProfile(base)) return base;
+      return `${base} / ${profileName(row?.profile)}`;
+    }
+
+    function colorForToolLabel(name) {
+      return colorFor(String(name || "").split(" / ")[0]);
+    }
+
     function modelName(value) {
       const text = String(value || "").trim();
       const lower = text.toLowerCase();
       if (!text || lower === "unknown") return "其他";
       if (lower.startsWith("__") || lower.includes("bad_model") || lower.includes("fallback_test")) return "其他";
+      const separatedGlm = lower.match(/^glm[-_ ]?(\\d+)[._-](\\d+)$/);
+      if (separatedGlm) return `GLM-${separatedGlm[1]}.${separatedGlm[2]}`;
+      const separatedGpt = lower.match(/^gpt[-_ ]?(\\d+)[._-](\\d+)(.*)$/);
+      if (separatedGpt) return `GPT-${separatedGpt[1]}.${separatedGpt[2]}${separatedGpt[3]}`;
+      const compactGlm = lower.replace(/[^a-z0-9]/g, "").match(/^glm(\\d)(\\d+)$/);
+      if (compactGlm) return `GLM-${compactGlm[1]}.${compactGlm[2]}`;
+      const compactGpt = lower.replace(/[^a-z0-9]/g, "").match(/^gpt(\\d)(\\d+)$/);
+      if (compactGpt) return `GPT-${compactGpt[1]}.${compactGpt[2]}`;
       return text;
     }
 
@@ -848,17 +1008,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       return `${y}-${m}-${d}`;
     }
 
-    function latestDate(rows) {
-      const dates = rows.map(row => row.date).filter(Boolean).sort();
-      return dates.length ? dates[dates.length - 1] : isoToday();
-    }
-
-    function continuousDates(rows) {
+    function continuousDates(rows, endDate = null) {
       const dates = [...new Set(rows.map(row => row.date).filter(Boolean))].sort();
-      if (!dates.length) return [isoToday()];
+      if (!dates.length) return [endDate || isoToday()];
       const out = [];
       let cursor = dates[0];
-      const end = dates[dates.length - 1];
+      const lastDataDate = dates[dates.length - 1];
+      const end = endDate && endDate > lastDataDate ? endDate : lastDataDate;
       while (cursor <= end && out.length < 500) {
         out.push(cursor);
         cursor = addDays(cursor, 1);
@@ -910,17 +1066,16 @@ DASHBOARD_HTML = r"""<!doctype html>
       return state.selectedAgent === "all" || toolName(row.agent) === state.selectedAgent;
     }
 
-    function anchorDate(data) {
-      const today = isoToday();
-      return (data.dailyByTool || []).some(row => row.date === today) ? today : latestDate(data.dailyByTool || []);
+    function anchorDate() {
+      return isoToday();
     }
 
     function buildContext(data) {
-      const allDays = continuousDates(data.dailyByTool || []);
+      const allDays = continuousDates(data.dailyByTool || [], isoToday());
       state.chartDays = allDays;
       const option = rangeOption();
       const last = allDays.length - 1;
-      const anchor = anchorDate(data);
+      const anchor = anchorDate();
       const anchorIndex = Math.max(0, allDays.indexOf(anchor));
       if (state.chartEndIndex == null || state.chartEndIndex > last) {
         state.chartEndIndex = clamp(anchorIndex - option.offset, 0, last);
@@ -953,7 +1108,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const visibleTools = state.agentExpanded ? tools : tools.slice(0, 5);
       const agentButtons = [
         `<button class="filter-chip ${state.selectedAgent === "all" ? "active" : ""}" type="button" data-agent="all">总榜</button>`,
-        ...visibleTools.map(name => `<button class="filter-chip ${state.selectedAgent === name ? "active" : ""}" type="button" data-agent="${name}">${name}</button>`)
+        ...visibleTools.map(name => `<button class="filter-chip ${state.selectedAgent === name ? "active" : ""}" type="button" data-agent="${escapeHtml(name)}">${escapeHtml(name)}</button>`)
       ];
       if (tools.length > visibleTools.length) {
         agentButtons.push(`<button class="filter-chip" type="button" data-action="more-agents">更多 ${tools.length - visibleTools.length}</button>`);
@@ -979,6 +1134,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       document.getElementById("syncText").textContent = "最近同步 刚刚";
       document.getElementById("toolRankTitle").textContent = `${context.option.title}按工具`;
       document.getElementById("modelRankTitle").textContent = `${context.option.title}按模型`;
+      document.getElementById("profileRankTitle").textContent = `${context.option.title}按 Profile`;
     }
 
     function renderShare(context) {
@@ -1072,18 +1228,37 @@ DASHBOARD_HTML = r"""<!doctype html>
         row => modelName(row.model),
         (_row, index) => MODEL_COLORS[index % MODEL_COLORS.length]
       );
-      document.getElementById("toolRanks").innerHTML = rankRows(toolRanks, state.toolExpanded ? toolRanks.ranked.length : 3);
-      document.getElementById("modelRanks").innerHTML = rankRows(modelRanks, state.modelExpanded ? modelRanks.ranked.length : 3);
+      const toolLimit = state.toolExpanded || toolRanks.ranked.length <= RANK_COLLAPSE_THRESHOLD
+        ? toolRanks.ranked.length
+        : RANK_COLLAPSE_THRESHOLD;
+      const modelLimit = state.modelExpanded || modelRanks.ranked.length <= RANK_COLLAPSE_THRESHOLD
+        ? modelRanks.ranked.length
+        : RANK_COLLAPSE_THRESHOLD;
+      document.getElementById("toolRanks").innerHTML = rankRows(toolRanks, toolLimit);
+      document.getElementById("modelRanks").innerHTML = rankRows(modelRanks, modelLimit);
       updateToggle("toggleTools", state.toolExpanded, toolRanks.ranked.length, "工具");
       updateToggle("toggleModels", state.modelExpanded, modelRanks.ranked.length, "模型");
+    }
+
+    function renderProfileRanks(context) {
+      const profileRows = context.toolRows.filter(row => shouldSplitProfile(toolName(row.agent)));
+      const profileRanks = buildRankRows(
+        profileRows,
+        row => profileLabel(row),
+        row => colorForToolLabel(row.name)
+      );
+      const profileLimit = state.profileExpanded || profileRanks.ranked.length <= RANK_COLLAPSE_THRESHOLD
+        ? profileRanks.ranked.length
+        : RANK_COLLAPSE_THRESHOLD;
+      document.getElementById("profileRanks").innerHTML = rankRows(profileRanks, profileLimit);
+      updateToggle("toggleProfiles", state.profileExpanded, profileRanks.ranked.length, "Profile");
     }
 
     function updateToggle(id, expanded, count, label) {
       const button = document.getElementById(id);
       if (!button) return;
-      if (count <= 3) {
-        button.textContent = `全部${label}已显示`;
-        button.hidden = false;
+      if (count <= RANK_COLLAPSE_THRESHOLD) {
+        button.hidden = true;
         return;
       }
       button.hidden = false;
@@ -1126,6 +1301,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderTop(context);
       renderShare(context);
       renderRanks(context);
+      renderProfileRanks(context);
       renderHistoryDetails(data);
     }
 
@@ -1142,6 +1318,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           state.selectedAgent = button.dataset.agent;
           state.toolExpanded = false;
           state.modelExpanded = false;
+          state.profileExpanded = false;
           if (state.data) renderDashboard(state.data);
         }
       });
@@ -1152,17 +1329,23 @@ DASHBOARD_HTML = r"""<!doctype html>
         state.chartEndIndex = null;
         state.toolExpanded = false;
         state.modelExpanded = false;
+        state.profileExpanded = false;
         if (state.data) renderDashboard(state.data);
       });
 
       const toolButton = document.getElementById("toggleTools");
       const modelButton = document.getElementById("toggleModels");
+      const profileButton = document.getElementById("toggleProfiles");
       toolButton.addEventListener("click", () => {
         state.toolExpanded = !state.toolExpanded;
         if (state.data) renderDashboard(state.data);
       });
       modelButton.addEventListener("click", () => {
         state.modelExpanded = !state.modelExpanded;
+        if (state.data) renderDashboard(state.data);
+      });
+      profileButton.addEventListener("click", () => {
+        state.profileExpanded = !state.profileExpanded;
         if (state.data) renderDashboard(state.data);
       });
 
@@ -1202,9 +1385,9 @@ DASHBOARD_HTML = r"""<!doctype html>
       setStatus("加载中...");
       try {
         const [dailyByTool, dailyByModel, dailyByAgentModel] = await Promise.all([
-          api("/api/v1/daily?since=all&group_by=agent"),
+          api("/api/v1/daily?since=all&group_by=agent,profile"),
           api("/api/v1/daily?since=all&group_by=model"),
-          api("/api/v1/daily?since=all&group_by=agent,model")
+          api("/api/v1/daily?since=all&group_by=agent,profile,model")
         ]);
         const data = {
           dailyByTool: dailyByTool.rows || [],
@@ -1221,6 +1404,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     wireInteractions();
     refresh();
+    setInterval(refresh, 60 * 1000);
   </script>
 </body>
 </html>

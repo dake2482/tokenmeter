@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,9 @@ class UsageRecord:
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     estimated_cost_usd: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "model", normalize_model_name(self.model))
 
     @property
     def total_tokens(self) -> int:
@@ -79,6 +83,28 @@ class UsageRecord:
         )
 
 
+def normalize_model_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    separated_glm = re.fullmatch(r"glm[-_ ]?(\d+)[._-](\d+)", lower)
+    if separated_glm:
+        return f"GLM-{separated_glm.group(1)}.{separated_glm.group(2)}"
+    separated_gpt = re.fullmatch(r"gpt[-_ ]?(\d+)[._-](\d+)(.*)", lower)
+    if separated_gpt:
+        return f"GPT-{separated_gpt.group(1)}.{separated_gpt.group(2)}{separated_gpt.group(3)}"
+
+    compact = re.sub(r"[^a-z0-9]", "", lower)
+    compact_glm = re.fullmatch(r"glm(\d)(\d+)", compact)
+    if compact_glm:
+        return f"GLM-{compact_glm.group(1)}.{compact_glm.group(2)}"
+    compact_gpt = re.fullmatch(r"gpt(\d)(\d+)", compact)
+    if compact_gpt:
+        return f"GPT-{compact_gpt.group(1)}.{compact_gpt.group(2)}"
+    return text
+
+
 def _int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -93,4 +119,3 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-

@@ -38,6 +38,23 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--bind", default="127.0.0.1:18888")
     serve_parser.add_argument("--db", default="data/tokenmeter.sqlite")
     serve_parser.add_argument("--token", default=os.environ.get("TOKENMETER_TOKEN"))
+    serve_parser.add_argument(
+        "--auto-import-interval",
+        default="15m",
+        help="run local import in the background every interval, e.g. 15m; use 0 to disable",
+    )
+    serve_parser.add_argument(
+        "--auto-import-since",
+        default="1d",
+        help="collection window for each background import, e.g. 1d",
+    )
+    serve_parser.add_argument("--auto-import-home", default=str(Path.home()))
+    serve_parser.add_argument("--auto-import-host", default=socket.gethostname())
+    serve_parser.add_argument(
+        "--auto-import-agents",
+        default="hermes,openclaw,codex,zcode,workbuddy,claude",
+        help="comma-separated agents for background import",
+    )
 
     import_parser = subparsers.add_parser("import", help="store local collection in a central SQLite DB")
     _add_collect_args(import_parser)
@@ -110,7 +127,20 @@ def _cmd_upload(args: argparse.Namespace) -> int:
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     host, port = _parse_bind(args.bind)
-    run_server(host, port, Path(args.db), args.token)
+    auto_import_agents = tuple(
+        agent.strip() for agent in args.auto_import_agents.split(",") if agent.strip()
+    )
+    run_server(
+        host,
+        port,
+        Path(args.db),
+        args.token,
+        auto_import_interval_seconds=_parse_duration_seconds(args.auto_import_interval),
+        auto_import_since=args.auto_import_since,
+        auto_import_home=Path(args.auto_import_home),
+        auto_import_host=args.auto_import_host,
+        auto_import_agents=auto_import_agents,
+    )
     return 0
 
 
@@ -148,6 +178,22 @@ def _parse_bind(value: str) -> tuple[str, int]:
         return value, 18888
     host, port = value.rsplit(":", 1)
     return host, int(port)
+
+
+def _parse_duration_seconds(value: str | int | float | None) -> float:
+    if value is None:
+        return 0
+    if isinstance(value, int | float):
+        return float(value)
+    text = value.strip().lower()
+    if not text:
+        return 0
+    if text in {"0", "off", "false", "none", "disabled"}:
+        return 0
+    if text[-1:] in {"s", "m", "h", "d"}:
+        amount = float(text[:-1])
+        return amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[text[-1]]
+    return float(text)
 
 
 if __name__ == "__main__":

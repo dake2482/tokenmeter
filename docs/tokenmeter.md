@@ -67,6 +67,8 @@ Run the central receiver:
 TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter serve --bind 127.0.0.1:18888 --db data/tokenmeter.sqlite
 ```
 
+By default, `serve` immediately runs a local import, then repeats that import every 15 minutes with `--auto-import-since 1d`. Disable it with `--auto-import-interval 0`.
+
 Open the web dashboard:
 
 ```text

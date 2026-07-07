@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
+from tokenmeter.records import UsageRecord
 from tokenmeter.storage import daily_summary_db, upsert_records
 from tokenmeter.summary import summarize_records
 
@@ -47,6 +49,37 @@ class TokenMeterTests(unittest.TestCase):
     def test_parse_since_relative_window(self) -> None:
         self.assertEqual(parse_since("2h", now=10_000), 2_800)
         self.assertIsNone(parse_since("all", now=10_000))
+
+    def test_parse_duration_seconds(self) -> None:
+        self.assertEqual(_parse_duration_seconds("15m"), 900)
+        self.assertEqual(_parse_duration_seconds("1h"), 3600)
+        self.assertEqual(_parse_duration_seconds("0"), 0)
+
+    def test_glm_model_name_variants_are_normalized_for_summary(self) -> None:
+        records = [
+            _usage_record("a", "glm5.2", 10),
+            _usage_record("b", "GLM-5.2", 20),
+            _usage_record("c", "glm-5.2", 30),
+        ]
+
+        rows = summarize_records(records, group_by=("model",))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "GLM-5.2")
+        self.assertEqual(rows[0]["total_tokens"], 60)
+
+    def test_gpt_model_name_variants_are_normalized_for_summary(self) -> None:
+        records = [
+            _usage_record("a", "gpt5.5", 10),
+            _usage_record("b", "GPT-5.5", 20),
+            _usage_record("c", "gpt-5.5", 30),
+        ]
+
+        rows = summarize_records(records, group_by=("model",))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "GPT-5.5")
+        self.assertEqual(rows[0]["total_tokens"], 60)
 
     def test_daily_summary_groups_records_by_date_and_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,6 +145,21 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].total_tokens, 3000)
         self.assertEqual(records[0].timestamp, 2000)
+
+
+def _usage_record(record_id: str, model: str, tokens: int) -> UsageRecord:
+    return UsageRecord(
+        record_id=record_id,
+        host="test-host",
+        agent="test",
+        profile="default",
+        source="test",
+        session_id=record_id,
+        provider="test",
+        model=model,
+        timestamp=0,
+        input_tokens=tokens,
+    )
 
 
 def _make_hermes_db(path: Path, session_id: str, started_at: float, input_tokens: int) -> None:
