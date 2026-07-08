@@ -1,168 +1,117 @@
 # TokenMeter
 
-TokenMeter 是一个可以自部署的 Token 用量统计工具，用来把多台服务器、多个 Agent、多个 profile 的使用记录汇总到一个 Web 页面里查看。
+TokenMeter 是一个自部署的 Agent token 用量统计工具。它把多台机器上的 Hermes、OpenClaw、Codex、ZCode、WorkBuddy、Claude Code 用量采集到一个中心 SQLite 数据库，并提供一个 Web 看板查看按工具、模型、服务器、Profile 和历史日期的统计。
 
-它目前主要面向本机和服务器上的 Agent 工作流：
+它适合这样使用：
 
-- Hermes：读取 `~/.hermes/state.db` 以及 `~/.hermes/profiles/*/state.db`。
-- OpenClaw：读取 `~/.openclaw/agents/*/sessions/*.trajectory.jsonl`。
-- Codex：通过 `~/.codex/state_5.sqlite` 定位 rollout，并读取 `token_count.last_token_usage` 增量。
-- ZCode：读取 `~/.zcode/cli/db/db.sqlite` 的 `model_usage`。
-- WorkBuddy / Claude Code：读取各自 `projects/**/*.jsonl` 里的 usage 元数据。
-- 多机器汇总：每台机器本地采集后上传到中心服务。
-- Web 看板：按 Agent、时间范围、模型、历史日期查看 token 用量。
+- 一台机器作为中心服务，运行 Web 看板和接收 API。
+- 其他机器安装轻量上传器，每 15 分钟采集本机 token 用量并上传。
+- 所有安装都可以通过一条命令完成，适合直接贴给 AI Agent 执行。
 
-TokenMeter 只读取 Token 统计相关字段，不读取 Hermes 消息正文、Claude Code / WorkBuddy 消息正文或 prompt 内容。
+TokenMeter 只读取 token usage、模型、时间、cwd、session 等统计元数据，不读取消息正文、prompt、回复正文或密钥。
 
-## 功能特性
+## AI 一键安装
 
-- 支持按 Agent 统计：OpenClaw、Hermes、Codex、ZCode、WorkBuddy、Claude Code。
-- 支持区分 Hermes / OpenClaw 的 profile，并尽量从 cwd 或 Agent 配置推导其他工具的 profile。
-- 支持按日期、模型、Agent 聚合。
-- 支持中心 SQLite 存储，方便单机部署和备份。
-- 支持 Web 页面查看今日、昨日、近 3 天、近 7 天、近 30 天。
-- 支持真实 SVG 占比图，鼠标悬停可查看具体 token 和占比。
-- 支持 favicon、Apple Touch Icon 和 Web App Manifest，保存到桌面时会显示专用图标。
-- 支持简单 Bearer Token 保护 API。
-
-## 快速开始
-
-先在当前机器采集最近 24 小时的数据：
+把下面命令贴给要部署中心看板的 AI 或服务器终端：
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh | sudo sh -s -- server
+```
+
+安装完成后会输出：
+
+- Web 看板地址：默认 `http://<server>:18888/`
+- API token：默认自动生成，打开页面时填入
+- 给其他机器安装上传器的示例命令
+
+如果之后忘记 token，root Linux 安装默认可以在 `/etc/tokenmeter.env` 中查看。
+
+如果你想自己指定 token：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | sudo env TOKENMETER_TOKEN="change-this-long-random-token" sh -s -- server
+```
+
+如果只想在本机或内网试用，不启用 API token：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | sudo env TOKENMETER_DISABLE_TOKEN=1 sh -s -- server
+```
+
+在其他机器安装上传器，把 `TOKENMETER_SERVER` 和 `TOKENMETER_TOKEN` 换成你的中心服务地址和 token：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | TOKENMETER_SERVER="https://your-tokenmeter.example.com" TOKENMETER_TOKEN="your-token" sh -s -- agent
+```
+
+如果目标机器需要 root 权限安装 systemd timer：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | sudo env TOKENMETER_SERVER="https://your-tokenmeter.example.com" TOKENMETER_TOKEN="your-token" sh -s -- agent
+```
+
+默认安装当前 GitHub 仓库 `dake2482/tokenmeter` 的 `main` 分支。Fork 后可以这样安装自己的版本：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | sudo env TOKENMETER_REPO="your-name/tokenmeter" TOKENMETER_REF="main" sh -s -- server
+```
+
+## 安装脚本参数
+
+`scripts/install.sh` 支持两个模式：
+
+- `server`：安装中心 Web 看板和本机自动采集服务。
+- `agent`：安装上传器，立即上传最近 30 天数据，并创建每 15 分钟上传最近 1 天数据的定时任务。
+
+常用环境变量：
+
+- `TOKENMETER_REPO`：GitHub 仓库，默认 `dake2482/tokenmeter`。
+- `TOKENMETER_REF`：分支、tag 或 commit SHA，默认 `main`。
+- `TOKENMETER_DIR`：安装目录。root Linux 默认 `/opt/tokenmeter`，普通用户默认 `~/.local/share/tokenmeter`。
+- `TOKENMETER_BIND`：中心服务监听地址，默认 `0.0.0.0:18888`。
+- `TOKENMETER_DB`：中心 SQLite 数据库路径，root Linux 默认 `/var/lib/tokenmeter/tokenmeter.sqlite`。
+- `TOKENMETER_TOKEN`：API Bearer token。server 模式未设置时会自动生成。
+- `TOKENMETER_DISABLE_TOKEN=1`：server 模式禁用 API token，仅建议本机或内网试用。
+- `TOKENMETER_SERVER`：agent 模式上传目标，例如 `https://your-tokenmeter.example.com`。
+- `TOKENMETER_HOST`：上报主机名，默认 `hostname`。
+- `TOKENMETER_INTERVAL`：上传间隔秒数，默认 `900`。
+- `TOKENMETER_BOOTSTRAP_SINCE`：首次上传窗口，默认 `30d`。
+- `TOKENMETER_SINCE`：后续定时上传窗口，默认 `1d`。
+- `TOKENMETER_AGENTS`：采集 Agent 列表，默认 `hermes,openclaw,codex,zcode,workbuddy,claude`。
+
+## 手动运行
+
+克隆仓库后可以直接用 Python 运行，不需要额外依赖：
+
+```sh
+git clone https://github.com/dake2482/tokenmeter.git
+cd tokenmeter
 PYTHONPATH=src python3 -m tokenmeter collect --since 24h
 ```
 
-导入本机数据到中心 SQLite：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter import \
-  --db data/tokenmeter.sqlite \
-  --since 24h
-```
-
-启动 Web 看板：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter serve \
-  --bind 127.0.0.1:18888 \
-  --db data/tokenmeter.sqlite
-```
-
-`serve` 默认会立即采集一次本机数据，之后每 15 分钟自动采集最近 1 天的数据并写入中心库。页面会每 60 秒自动刷新 API 数据。
-
-如需关闭服务内自动采集：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter serve \
-  --bind 127.0.0.1:18888 \
-  --db data/tokenmeter.sqlite \
-  --auto-import-interval 0
-```
-
-然后打开：
-
-```text
-http://127.0.0.1:18888/
-```
-
-如果要让同一局域网的其他机器访问，可以绑定到 `0.0.0.0`：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter serve \
-  --bind 0.0.0.0:18888 \
-  --db data/tokenmeter.sqlite
-```
-
-访问地址类似：
-
-```text
-http://<服务器 IP>:18888/
-```
-
-## 多服务器上传
-
-中心服务器启动时建议配置访问 token：
+启动中心看板：
 
 ```sh
 TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter serve \
   --bind 0.0.0.0:18888 \
-  --db /var/lib/tokenmeter/tokenmeter.sqlite
+  --db data/tokenmeter.sqlite
 ```
 
-中心服务器也可以调整自动采集间隔，例如每 15 分钟：
-
-```sh
-TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter serve \
-  --bind 0.0.0.0:18888 \
-  --db /var/lib/tokenmeter/tokenmeter.sqlite \
-  --auto-import-interval 15m \
-  --auto-import-since 1d
-```
-
-其他服务器上传数据：
+从另一台机器上传：
 
 ```sh
 TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter upload \
-  --server http://<中心服务器 IP>:18888 \
+  --server http://your-tokenmeter-server:18888 \
   --host "$(hostname)" \
   --since 7d
 ```
 
-建议后续用 systemd timer、cron 或 macOS LaunchAgent 定时执行 `tokenmeter upload`。
-
-## 一键安装上传器
-
-其他机器只需要执行下面这条命令，就会安装本机上传器、立即上传最近 30 天数据，并创建每 15 分钟上传最近 1 天数据的定时任务：
-
-```sh
-curl -fsSL https://tokenmeter.example.com/tokenmeter/install.sh | sh
-```
-
-如果目标机器需要 root 权限安装 systemd timer，可以使用：
-
-```sh
-curl -fsSL https://tokenmeter.example.com/tokenmeter/install.sh | sudo sh
-```
-
-默认中心地址会由安装脚本所在域名自动推导。也可以显式指定：
-
-```sh
-curl -fsSL https://tokenmeter.example.com/tokenmeter/install.sh | sh -s -- "https://tokenmeter.example.com"
-```
-
-常用环境变量：
-
-- `TOKENMETER_HOST`: 覆盖上报主机名，默认 `hostname`。
-- `TOKENMETER_INTERVAL`: 定时上传间隔秒数，默认 `900`。
-- `TOKENMETER_BOOTSTRAP_SINCE`: 首次上传窗口，默认 `30d`。
-- `TOKENMETER_SINCE`: 后续定时上传窗口，默认 `1d`。
-- `TOKENMETER_AGENTS`: 采集 Agent 列表，默认 `hermes,openclaw,codex,zcode,workbuddy,claude`。
-- `TOKENMETER_TOKEN`: 如果中心服务启用了 Bearer Token，在这里填写。
-
-## 常用命令
-
-查看本机统计：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter collect --since 7d
-```
-
-按 JSON 输出：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter collect --since 7d --format json
-```
-
 查看中心库汇总：
-
-```sh
-PYTHONPATH=src python3 -m tokenmeter summary \
-  --db data/tokenmeter.sqlite \
-  --since 7d
-```
-
-按指定维度汇总：
 
 ```sh
 PYTHONPATH=src python3 -m tokenmeter summary \
@@ -171,66 +120,38 @@ PYTHONPATH=src python3 -m tokenmeter summary \
   --group-by host,agent,profile,model
 ```
 
-调用 API：
+## 支持的数据源
 
-```sh
-curl -H "Authorization: Bearer $TOKENMETER_TOKEN" \
-  "http://127.0.0.1:18888/api/v1/summary?since=7d&group_by=host,agent,profile,model"
-```
+- Hermes：`~/.hermes/state.db` 和 `~/.hermes/profiles/<profile>/state.db`
+- OpenClaw：`~/.openclaw/agents/<profile>/sessions/*.trajectory.jsonl`
+- Codex：`~/.codex/sqlite/state_5.sqlite` 以及 rollout JSONL 中的 `token_count.last_token_usage`
+- ZCode：`~/.zcode/cli/db/db.sqlite` 的 `model_usage`
+- WorkBuddy：`~/.workbuddy/projects/**/*.jsonl`
+- Claude Code：`~/.claude/projects/**/*.jsonl`
 
-## Web 页面
+Codex 不按线程级 `tokens_used` 汇总，因为该字段是线程累计值，跨天继续使用会把历史量算到当天。TokenMeter 读取 rollout JSONL 中每次 `token_count` 事件的增量 usage，并按事件时间归档。
 
-Web 页面包含：
+OpenClaw 只统计 `model.completed` 事件，并跳过重复的 `trace.artifacts` usage 快照。
+
+## Web 看板
+
+看板包含：
 
 - 顶部筛选：按 Agent 和时间范围筛选。
-- 今日/昨日/区间数据：展示当前筛选范围的总 token、成本、活跃天数。
-- 用量占比：真实 SVG 图表，悬停显示具体 token 和占比。
+- 今日/昨日/区间数据：展示当前筛选范围的总 token、估算成本、活跃天数。
+- 用量占比：真实 SVG 饼图，悬停显示具体 token 和占比。
 - 按模型：展示当前筛选范围内各模型占比。
 - 按服务器：展示当前筛选范围内各上报服务器占比。
 - 按 Profile：展示 OpenClaw 和 Hermes 的 profile 占比。
-- 历史明细：展示完整历史日期数据，不随时间范围筛选收缩。
-
-## 数据来源
-
-Hermes 数据来源：
-
-- `~/.hermes/state.db`
-- `~/.hermes/profiles/<profile>/state.db`
-
-OpenClaw 数据来源：
-
-- `~/.openclaw/agents/<profile>/sessions/*.trajectory.jsonl`
-
-OpenClaw 目前只统计 `model.completed` 事件，并跳过重复的 `trace.artifacts` usage 快照。
-
-Codex 数据来源：
-
-- `~/.codex/sqlite/state_5.sqlite`
-
-Codex 不按线程级 `tokens_used` 汇总，因为该字段是线程累计值，跨天继续使用会把历史量算到当天。TokenMeter 读取 rollout JSONL 中每次 `token_count` 的 `last_token_usage`，按事件时间归档到对应日期。
-
-ZCode 数据来源：
-
-- `~/.zcode/cli/db/db.sqlite`
-
-ZCode 读取 `model_usage` 表，并把缓存 token 从 input 中拆出，避免重复计入总量。
-
-WorkBuddy 数据来源：
-
-- `~/.workbuddy/projects/**/*.jsonl`
-
-Claude Code 数据来源：
-
-- `~/.claude/projects/**/*.jsonl`
-
-这两个 JSONL 来源只读取 usage、模型、时间、cwd、session 等元数据，不读取正文。
+- 历史明细：展示完整历史日期数据，不随顶部时间范围收缩。
 
 ## 安全说明
 
 - 不要提交 `.env`、API token、SQLite 数据库、日志或本机采集结果。
 - `data/*.sqlite`、`*.db`、`*.log` 等运行产物已经通过 `.gitignore` 排除。
-- 对公网部署时建议放在 HTTPS 反向代理、Tailscale、SSH 隧道或内网环境后面。
+- 公网部署建议放在 HTTPS 反向代理、Tailscale、SSH 隧道或内网环境后面。
 - `TOKENMETER_TOKEN` 请使用足够长的随机字符串。
+- 一键安装脚本会把 token 写入本机服务环境文件；这些文件只留在被安装的机器上，不会提交到仓库。
 
 ## 开发与测试
 
@@ -244,26 +165,22 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 
 ```sh
 PYTHONPATH=src python3 -m py_compile src/tokenmeter/*.py
+sh -n scripts/install.sh
 ```
 
 ## 项目结构
 
 ```text
+scripts/install.sh  # 通用一键安装入口
+
 src/tokenmeter/
-  collectors.py   # 各 Agent 采集逻辑
-  records.py      # 统一 usage record 数据结构
-  storage.py      # SQLite 存储和每日聚合
-  summary.py      # 汇总和表格输出
-  server.py       # HTTP API 和 Web 页面
-  __main__.py     # CLI 入口
+  collectors.py     # 各 Agent 采集逻辑
+  records.py        # 统一 usage record 数据结构
+  storage.py        # SQLite 存储和每日聚合
+  summary.py        # 汇总和表格输出
+  server.py         # HTTP API 和 Web 页面
+  __main__.py       # CLI 入口
 
 tests/
   test_tokenmeter.py
-
-docs/
-  tokenmeter.md   # 设计和部署说明
 ```
-
-## 当前版本
-
-当前版本为 `0.1.0`，重点覆盖本地采集、中心上传、SQLite 汇总和 Web 看板。

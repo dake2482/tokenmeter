@@ -400,7 +400,7 @@ def _source_tarball() -> bytes:
     root = Path(__file__).resolve().parents[2]
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for rel in ("pyproject.toml", "README.md", "docs/tokenmeter.md", "assets", "src", "tests"):
+        for rel in ("pyproject.toml", "README.md", "docs/tokenmeter.md", "assets", "scripts", "src", "tests"):
             path = root / rel
             if path.exists():
                 tar.add(path, arcname=f"tokenmeter/{rel}", filter=_tar_filter)
@@ -570,14 +570,14 @@ EOF_TIMER
 }}
 
 install_launchd() {{
-  PLIST="$HOME/Library/LaunchAgents/com.dake.tokenmeter-upload.plist"
+  PLIST="$HOME/Library/LaunchAgents/io.tokenmeter.upload.plist"
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
   cat > "$PLIST" <<EOF_PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.dake.tokenmeter-upload</string>
+  <key>Label</key><string>io.tokenmeter.upload</string>
   <key>ProgramArguments</key>
   <array><string>$RUNNER</string></array>
   <key>EnvironmentVariables</key>
@@ -598,7 +598,7 @@ install_launchd() {{
 EOF_PLIST
   launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  launchctl kickstart -k "gui/$(id -u)/com.dake.tokenmeter-upload" || true
+  launchctl kickstart -k "gui/$(id -u)/io.tokenmeter.upload" || true
 }}
 
 echo "▸ 首次上传最近 $TOKENMETER_BOOTSTRAP_SINCE 数据..."
@@ -614,7 +614,7 @@ if [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
   fi
 elif [ "$OS" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
   install_launchd
-  echo "✓ 已安装 launchd: com.dake.tokenmeter-upload"
+  echo "✓ 已安装 launchd: io.tokenmeter.upload"
 else
   echo "已安装到 $INSTALL_DIR，但当前系统没有可用的 systemd/launchd。"
   echo "请手动定时运行: $RUNNER"

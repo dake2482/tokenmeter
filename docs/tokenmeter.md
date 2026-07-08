@@ -1,8 +1,8 @@
 # TokenMeter
 
-TokenMeter is a small self-hosted token usage collector for the machines that run local agents. It borrows the useful part of TokenRank's install shape: one command installs a local collector, binds it to an upload endpoint, performs a first upload, then schedules future uploads.
+TokenMeter is a small self-hosted token usage collector for machines that run local agents. It borrows the useful part of TokenRank's install shape: one command installs a local collector, binds it to an upload endpoint, performs a first upload, then schedules future uploads.
 
-This repository implements the collector and the central HTTP receiver first. The installer can be layered on top once the target server URL is fixed.
+The repository now includes a generic GitHub-hosted installer at `scripts/install.sh`. It can install either the central dashboard server or an uploader agent on another machine.
 
 ## What The TokenRank Pattern Does
 
@@ -13,13 +13,20 @@ The reviewed installer script does four things:
 3. Runs `connect`, `upload`, and `service install` through that binary.
 4. Leaves the binary under `$HOME/.local/bin` and tells the user where to view results.
 
-For our own servers, the equivalent shape should be:
+For TokenMeter, the equivalent shape is:
 
 ```sh
-curl -fsSL https://your-domain.example/tokenmeter/install.sh | sh -s -- "https://your-domain.example/api/v1/usage?token=..."
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh | sudo sh -s -- server
 ```
 
-The local collector should store the upload URL/token in a private ignored config file, then run `tokenmeter upload` on a timer.
+Then install uploaders on other machines:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | TOKENMETER_SERVER="https://your-tokenmeter.example.com" TOKENMETER_TOKEN="your-token" sh -s -- agent
+```
+
+The local collector stores the upload URL/token in a private service environment file, then runs `tokenmeter upload` on a timer.
 
 ## Data Model
 

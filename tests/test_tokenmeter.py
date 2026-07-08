@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,8 +151,8 @@ class TokenMeterTests(unittest.TestCase):
             home = Path(tmp)
             _make_codex_db(home / ".codex" / "sqlite" / "state_5.sqlite")
             _make_zcode_db(home / ".zcode" / "cli" / "db" / "db.sqlite")
-            _make_workbuddy_jsonl(home / ".workbuddy" / "projects" / "Users-dake-Project" / "run.jsonl")
-            _make_claude_jsonl(home / ".claude" / "projects" / "-Users-dake-Project" / "run.jsonl")
+            _make_workbuddy_jsonl(home / ".workbuddy" / "projects" / "Users-alice-Project" / "run.jsonl")
+            _make_claude_jsonl(home / ".claude" / "projects" / "-Users-alice-Project" / "run.jsonl")
 
             records = collect_all(home=home, host="test-host", since=0)
 
@@ -192,6 +193,21 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(manifest["start_url"], "/tokenmeter")
         self.assertEqual(manifest["scope"], "/tokenmeter/")
         self.assertIn("/tokenmeter/assets/tokenmeter-plain-t-icon-512.png", {icon["src"] for icon in manifest["icons"]})
+
+    def test_install_script_has_valid_shell_syntax(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        subprocess.run(["sh", "-n", "scripts/install.sh"], cwd=repo_root, check=True)
+
+    def test_readme_does_not_include_private_deployment_addresses(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        readme = (repo_root / "README.md").read_text(encoding="utf-8")
+        private_addresses = (
+            ".".join(("43", "159", "50", "227")),
+            ".".join(("192", "168", "3", "227")),
+        )
+
+        for address in private_addresses:
+            self.assertNotIn(address, readme)
 
 
 def _usage_record(record_id: str, model: str, tokens: int) -> UsageRecord:
@@ -323,7 +339,7 @@ def _make_codex_db(path: Path, token_count: int = 1000, updated_at: int = 1010) 
             """
             insert into threads values (
                 'codex-thread-1', ?, 1000, ?, 'vscode', 'codex_desktop', 'openai',
-                '/Users/dake/Project', ?, null, 'gpt-test'
+                '/Users/alice/Project', ?, null, 'gpt-test'
             )
             """,
             (str(rollout_path), updated_at, token_count),
@@ -395,7 +411,7 @@ def _make_workbuddy_jsonl(path: Path) -> None:
         "timestamp": 1_002_000,
         "type": "assistant",
         "sessionId": "wb-session-1",
-        "cwd": "/Users/dake/Project",
+        "cwd": "/Users/alice/Project",
         "providerData": {
             "agent": "default",
             "requestModelId": "work-model",
@@ -416,7 +432,7 @@ def _make_claude_jsonl(path: Path) -> None:
         "uuid": "claude-event-1",
         "timestamp": "1970-01-01T00:16:43Z",
         "entrypoint": "cli",
-        "cwd": "/Users/dake/Project",
+        "cwd": "/Users/alice/Project",
         "sessionId": "claude-session-1",
         "message": {
             "id": "msg-1",
