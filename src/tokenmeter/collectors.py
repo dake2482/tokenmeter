@@ -167,14 +167,20 @@ def collect_zcode(home: Path, host: str, since: float | None = None) -> list[Usa
 
 
 def collect_workbuddy(home: Path, host: str, since: float | None = None) -> list[UsageRecord]:
-    root = home / ".workbuddy" / "projects"
-    if not root.exists():
-        return []
     records: list[UsageRecord] = []
-    for path in sorted(root.glob("**/*.jsonl")):
-        if since is not None and _mtime_before(path, since):
-            continue
-        records.extend(_collect_workbuddy_jsonl(path, host, since))
+    root = home / ".workbuddy" / "projects"
+    if root.exists():
+        for path in sorted(root.glob("**/*.jsonl")):
+            if since is not None and _mtime_before(path, since):
+                continue
+            records.extend(_collect_workbuddy_jsonl(path, host, since))
+
+    trace_root = home / ".workbuddy" / "traces"
+    if trace_root.exists():
+        for path in sorted(trace_root.glob("**/*.json")):
+            if since is not None and _mtime_before(path, since):
+                continue
+            records.extend(_collect_workbuddy_trace_json(path, host, since))
     return records
 
 
@@ -503,6 +509,65 @@ def _collect_workbuddy_jsonl(path: Path, host: str, since: float | None) -> list
     return records
 
 
+def _collect_workbuddy_trace_json(path: Path, host: str, since: float | None) -> list[UsageRecord]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    trace = _as_dict(data.get("trace"))
+    spans = data.get("spans")
+    if not isinstance(spans, list):
+        return []
+
+    records: list[UsageRecord] = []
+    for index, item in enumerate(spans, start=1):
+        span = _as_dict(item)
+        if span.get("type") != "generation":
+            continue
+
+        timestamp = _parse_time(span.get("startedAt") or span.get("endedAt") or trace.get("startedAt"))
+        if since is not None and timestamp < since:
+            continue
+
+        usage = _workbuddy_usage(span)
+        model_from_output = ""
+        if not usage:
+            usage, model_from_output = _workbuddy_tool_output_usage(span.get("toolOutput"))
+        if not usage or sum(_int(usage.get(field)) for field in TOKEN_FIELDS) <= 0:
+            continue
+
+        trace_id = str(trace.get("traceId") or span.get("traceId") or path.stem)
+        span_id = str(span.get("spanId") or f"{path.stem}:{index}")
+        records.append(
+            UsageRecord(
+                record_id=f"workbuddy:trace:{trace_id}:{span_id}",
+                host=host,
+                agent="workbuddy",
+                profile=str(span.get("agent") or span.get("agentName") or "default"),
+                source=str(span.get("name") or span.get("type") or "trace"),
+                session_id=trace_id,
+                provider=str(span.get("provider") or span.get("providerId") or ""),
+                model=str(
+                    span.get("requestModelId")
+                    or span.get("model")
+                    or span.get("requestModelName")
+                    or model_from_output
+                    or ""
+                ),
+                timestamp=timestamp,
+                started_at=timestamp,
+                ended_at=_parse_time(span.get("endedAt")) or timestamp,
+                input_tokens=_int(usage.get("input_tokens")),
+                output_tokens=_int(usage.get("output_tokens")),
+                cache_read_tokens=_int(usage.get("cache_read_tokens")),
+                cache_write_tokens=_int(usage.get("cache_write_tokens")),
+                reasoning_tokens=_int(usage.get("reasoning_tokens")),
+            )
+        )
+    return records
+
+
 def _collect_claude_jsonl(path: Path, host: str, since: float | None) -> list[UsageRecord]:
     records: list[UsageRecord] = []
     try:
@@ -554,6 +619,10 @@ def _collect_claude_jsonl(path: Path, host: str, since: float | None) -> list[Us
 
 
 def _workbuddy_usage(event: dict) -> dict[str, int]:
+    usage = _as_dict(event.get("usage"))
+    if usage:
+        return _usage_from_unknown(usage)
+
     message = _as_dict(event.get("message"))
     usage = _as_dict(message.get("usage"))
     if usage:
@@ -568,6 +637,40 @@ def _workbuddy_usage(event: dict) -> dict[str, int]:
     if raw_usage:
         return _usage_from_raw(raw_usage)
     return {}
+
+
+def _workbuddy_tool_output_usage(value: object) -> tuple[dict[str, int], str]:
+    if not isinstance(value, str) or not value.strip():
+        return {}, ""
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return {}, ""
+
+    total = {field: 0 for field in TOKEN_FIELDS}
+    model = ""
+    for item in _walk_json_objects(payload):
+        usage = _as_dict(item.get("usage"))
+        if not usage:
+            continue
+        tokens = _usage_from_unknown(usage)
+        if sum(_int(tokens.get(field)) for field in TOKEN_FIELDS) <= 0:
+            continue
+        for field in TOKEN_FIELDS:
+            total[field] += _int(tokens.get(field))
+        if not model:
+            model = str(item.get("model") or item.get("modelId") or item.get("requestModelId") or "")
+    if sum(total.values()) <= 0:
+        return {}, ""
+    return total, model
+
+
+def _usage_from_unknown(usage: dict) -> dict[str, int]:
+    if any(key in usage for key in ("prompt_tokens", "completion_tokens", "prompt_tokens_details")):
+        return _usage_from_raw(usage)
+    if any(key in usage for key in ("inputTokens", "outputTokens", "inputTokensDetails")):
+        return _usage_from_camel(usage)
+    return _usage_from_snake(usage, subtract_cache=True)
 
 
 def _usage_from_snake(usage: dict, subtract_cache: bool) -> dict[str, int]:
@@ -636,6 +739,16 @@ def _sum_details(details: object, *keys: str) -> int:
 
 def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+def _walk_json_objects(value: object):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json_objects(child)
 
 
 def _openclaw_source(event: dict) -> str:

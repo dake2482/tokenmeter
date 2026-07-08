@@ -47,7 +47,7 @@ Codex uses `~/.codex/state_5.sqlite` as the thread index, then reads each rollou
 
 ZCode is read from `~/.zcode/cli/db/db.sqlite` `model_usage` rows. Cached tokens are split out from input tokens so totals do not double count cache.
 
-WorkBuddy is read from `~/.workbuddy/projects/**/*.jsonl` usage metadata.
+WorkBuddy is read from `~/.workbuddy/projects/**/*.jsonl` usage metadata and newer `~/.workbuddy/traces/**/*.json` generation spans. Trace files can contain prompts and tool output, but TokenMeter only persists usage/model/time/session metadata.
 
 Claude Code is read from `~/.claude/projects/**/*.jsonl` message usage metadata.
 

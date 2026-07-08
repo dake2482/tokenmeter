@@ -166,6 +166,22 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(by_agent["workbuddy"].cache_read_tokens, 100)
         self.assertEqual(by_agent["claude"].total_tokens, 67)
 
+    def test_collects_workbuddy_trace_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _make_workbuddy_trace_json(home / ".workbuddy" / "traces" / "123" / "trace_wb.json")
+
+            records = collect_all(home=home, host="test-host", since=0, agents=["workbuddy"])
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].record_id, "workbuddy:trace:trace-wb:span-generation-1")
+        self.assertEqual(records[0].profile, "default")
+        self.assertEqual(records[0].model, "GPT-5.5")
+        self.assertEqual(records[0].input_tokens, 70)
+        self.assertEqual(records[0].cache_read_tokens, 20)
+        self.assertEqual(records[0].output_tokens, 30)
+        self.assertEqual(records[0].reasoning_tokens, 10)
+
     def test_codex_uses_newest_state_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -422,6 +438,44 @@ def _make_workbuddy_jsonl(path: Path) -> None:
                 "outputTokensDetails": [{"reasoning_tokens": 5}],
             },
         },
+    }
+    path.write_text(json.dumps(event), encoding="utf-8")
+
+
+def _make_workbuddy_trace_json(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [
+        {
+            "model": "gpt-5.5",
+            "usage": {
+                "prompt_tokens": 90,
+                "completion_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 20},
+                "completion_tokens_details": {"reasoning_tokens": 10},
+            },
+        }
+    ]
+    event = {
+        "trace": {
+            "traceId": "trace-wb",
+            "startedAt": "1970-01-01T00:16:40Z",
+        },
+        "spans": [
+            {
+                "spanId": "span-ignored",
+                "type": "function",
+                "startedAt": "1970-01-01T00:16:40Z",
+                "toolOutput": json.dumps(payload),
+            },
+            {
+                "spanId": "span-generation-1",
+                "type": "generation",
+                "name": "generation",
+                "startedAt": "1970-01-01T00:16:41Z",
+                "endedAt": "1970-01-01T00:16:42Z",
+                "toolOutput": json.dumps(payload),
+            },
+        ],
     }
     path.write_text(json.dumps(event), encoding="utf-8")
 

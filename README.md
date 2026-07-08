@@ -126,7 +126,7 @@ PYTHONPATH=src python3 -m tokenmeter summary \
 - OpenClaw：`~/.openclaw/agents/<profile>/sessions/*.trajectory.jsonl`
 - Codex：`~/.codex/sqlite/state_5.sqlite` 以及 rollout JSONL 中的 `token_count.last_token_usage`
 - ZCode：`~/.zcode/cli/db/db.sqlite` 的 `model_usage`
-- WorkBuddy：`~/.workbuddy/projects/**/*.jsonl`
+- WorkBuddy：`~/.workbuddy/projects/**/*.jsonl` 和 `~/.workbuddy/traces/**/*.json`
 - Claude Code：`~/.claude/projects/**/*.jsonl`
 
 Codex 不按线程级 `tokens_used` 汇总，因为该字段是线程累计值，跨天继续使用会把历史量算到当天。TokenMeter 读取 rollout JSONL 中每次 `token_count` 事件的增量 usage，并按事件时间归档。
