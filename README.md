@@ -116,19 +116,19 @@ TOKENMETER_TOKEN="change-me" PYTHONPATH=src python3 -m tokenmeter upload \
 其他机器只需要执行下面这条命令，就会安装本机上传器、立即上传最近 30 天数据，并创建每 15 分钟上传最近 1 天数据的定时任务：
 
 ```sh
-curl -fsSL http://your-tokenmeter.example.com/tokenmeter/install.sh | sh
+curl -fsSL https://tokenmeter.example.com/tokenmeter/install.sh | sh
 ```
 
 如果目标机器需要 root 权限安装 systemd timer，可以使用：
 
 ```sh
-curl -fsSL http://your-tokenmeter.example.com/tokenmeter/install.sh | sudo sh
+curl -fsSL https://tokenmeter.example.com/tokenmeter/install.sh | sudo sh
 ```
 
-默认中心地址是 `http://your-tokenmeter.example.com`。也可以显式指定：
+默认中心地址会由安装脚本所在域名自动推导。也可以显式指定：
 
 ```sh
-curl -fsSL http://your-tokenmeter.example.com/tokenmeter/install.sh | sh -s -- "http://your-tokenmeter.example.com"
+curl -fsSL https://tokenmeter.example.com/tokenmeter/install.sh | sh -s -- "https://tokenmeter.example.com"
 ```
 
 常用环境变量：
