@@ -29,6 +29,8 @@ tmp/
 outputs/
 *.log
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite3
 *.db
 *.db-wal

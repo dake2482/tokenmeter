@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import re
+import math
+import time
 from dataclasses import dataclass
 from typing import Any
+
+
+MAX_TOKEN_COUNT = 1_000_000_000_000
+MAX_ESTIMATED_COST_USD = 1_000_000_000.0
+MAX_FUTURE_SECONDS = 7 * 86400
+TEXT_LIMITS = {
+    "record_id": 1024,
+    "host": 255,
+    "agent": 64,
+    "profile": 255,
+    "source": 255,
+    "session_id": 1024,
+    "provider": 255,
+    "model": 512,
+}
 
 
 @dataclass(frozen=True)
@@ -59,6 +76,45 @@ class UsageRecord:
             "estimated_cost_usd": self.estimated_cost_usd,
             "total_tokens": self.total_tokens,
         }
+
+    def validate_for_ingest(self, now: float | None = None) -> None:
+        for field, limit in TEXT_LIMITS.items():
+            value = getattr(self, field)
+            if field in {"record_id", "host", "agent"} and not value:
+                raise ValueError(f"{field} is required")
+            if len(value) > limit:
+                raise ValueError(f"{field} exceeds {limit} characters")
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                raise ValueError(f"{field} contains control characters")
+
+        current_time = time.time() if now is None else now
+        _validate_timestamp("timestamp", self.timestamp, required=True)
+        if self.timestamp > current_time + MAX_FUTURE_SECONDS:
+            raise ValueError("timestamp is too far in the future")
+        _validate_timestamp("started_at", self.started_at)
+        _validate_timestamp("ended_at", self.ended_at)
+        if self.started_at is not None and self.ended_at is not None and self.ended_at < self.started_at:
+            raise ValueError("ended_at is earlier than started_at")
+
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+        ):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{field} must be an integer")
+            if value < 0 or value > MAX_TOKEN_COUNT:
+                raise ValueError(f"{field} is outside the accepted range")
+        if self.total_tokens <= 0:
+            raise ValueError("record has no token usage")
+
+        if self.estimated_cost_usd is not None:
+            cost = self.estimated_cost_usd
+            if not math.isfinite(cost) or cost < 0 or cost > MAX_ESTIMATED_COST_USD:
+                raise ValueError("estimated_cost_usd is outside the accepted range")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "UsageRecord":
@@ -119,3 +175,12 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _validate_timestamp(name: str, value: float | None, required: bool = False) -> None:
+    if value is None:
+        if required:
+            raise ValueError(f"{name} is required")
+        return
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite timestamp")

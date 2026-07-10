@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import gzip
+import hmac
+import ipaddress
 import json
 import socket
 import io
+import re
+import shlex
 import tarfile
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,9 +20,12 @@ from .collectors import collect_all, parse_since
 from .records import UsageRecord
 from .storage import (
     daily_summary_db,
+    database_metadata_db,
     delete_legacy_codex_records,
     delete_legacy_openclaw_records,
+    delete_duplicate_workbuddy_records,
     delete_zero_token_records,
+    hourly_summary_db,
     summarize_db,
     upsert_records,
 )
@@ -37,7 +45,11 @@ DASHBOARD_GROUPS = {
     "dailyByHost": ("host", "agent"),
 }
 DASHBOARD_BASE_GROUP = ("host", "agent", "profile", "model")
+DASHBOARD_HOURLY_SINCE = "31d"
 DASHBOARD_CACHE_TTL_SECONDS = 30.0
+MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+MAX_RECORDS_PER_REQUEST = 5_000
+USAGE_SCHEMA_VERSION = 2
 DASHBOARD_NUMBER_COLUMNS = (
     "records",
     "sessions",
@@ -49,8 +61,15 @@ DASHBOARD_NUMBER_COLUMNS = (
     "total_tokens",
     "estimated_cost_usd",
 )
-_DASHBOARD_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_DASHBOARD_CACHE: dict[tuple[str, str, str], tuple[float, dict]] = {}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
+_SOURCE_TARBALL_CACHE: bytes | None = None
+_SOURCE_TARBALL_LOCK = threading.Lock()
+
+
+class TokenMeterHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 def run_server(
@@ -68,7 +87,7 @@ def run_server(
         server_token = token
         database_path = db_path
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = TokenMeterHTTPServer((host, port), Handler)
     stop_event: threading.Event | None = None
     worker: threading.Thread | None = None
     if auto_import_interval_seconds and auto_import_interval_seconds > 0:
@@ -120,6 +139,8 @@ def _auto_import_loop(
             if "openclaw" in agent_names:
                 cleaned += delete_legacy_openclaw_records(db_path)
             changed = upsert_records(db_path, records)
+            if "workbuddy" in agent_names:
+                cleaned += delete_duplicate_workbuddy_records(db_path)
             if changed or cleaned:
                 _clear_dashboard_cache()
             elapsed = time.time() - started
@@ -133,8 +154,14 @@ def _auto_import_loop(
 
 
 class TokenMeterHandler(BaseHTTPRequestHandler):
+    server_version = "TokenMeter"
+    sys_version = ""
     server_token: str | None = None
     database_path: Path
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(30)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -150,7 +177,13 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
             self._asset(asset_name)
             return
         if path == "/install.sh":
-            self._text(_install_script(self._public_base_url()))
+            try:
+                self._text(_install_script(self._public_base_url()))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, status=400)
+            return
+        if path == "/installer-core.sh":
+            self._text(_core_install_script())
             return
         if path == "/tokenmeter.tar.gz":
             self._bytes(_source_tarball(), "application/gzip")
@@ -165,7 +198,11 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
             since = query.get("since", [None])[0]
             group_by_text = query.get("group_by", ["host,agent,profile,source,provider,model"])[0]
             group_by = tuple(part.strip() for part in group_by_text.split(",") if part.strip())
-            rows = summarize_db(self.database_path, since=since, group_by=group_by)
+            try:
+                rows = summarize_db(self.database_path, since=since, group_by=group_by)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, status=400)
+                return
             self._json({"rows": rows})
             return
         if path == "/api/v1/dashboard":
@@ -173,16 +210,36 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
                 return
             query = parse_qs(parsed.query)
             since = query.get("since", ["all"])[0]
-            self._json(_cached_dashboard_payload(self.database_path, since=since))
+            timezone_name = query.get("timezone", [None])[0]
+            try:
+                payload = _cached_dashboard_payload(
+                    self.database_path,
+                    since=since,
+                    timezone_name=timezone_name,
+                )
+            except ValueError as exc:
+                self._json({"error": str(exc)}, status=400)
+                return
+            self._json(payload)
             return
         if path == "/api/v1/daily":
             if not self._authorized():
                 return
             query = parse_qs(parsed.query)
             since = query.get("since", ["30d"])[0]
+            timezone_name = query.get("timezone", [None])[0]
             group_by_text = query.get("group_by", ["agent"])[0]
             group_by = tuple(part.strip() for part in group_by_text.split(",") if part.strip())
-            rows = daily_summary_db(self.database_path, since=since, group_by=group_by)
+            try:
+                rows = daily_summary_db(
+                    self.database_path,
+                    since=since,
+                    group_by=group_by,
+                    timezone_name=timezone_name,
+                )
+            except ValueError as exc:
+                self._json({"error": str(exc)}, status=400)
+                return
             self._json({"rows": rows})
             return
         self.send_error(404)
@@ -197,14 +254,24 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json()
-            records = [UsageRecord.from_dict(item) for item in payload.get("records", [])]
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            self.send_error(400, f"invalid payload: {exc}")
+            records = _records_from_payload(payload)
+        except PayloadError as exc:
+            self._json({"error": exc.message}, status=exc.status)
             return
         changed = upsert_records(self.database_path, records)
-        if changed:
+        cleaned = 0
+        if any(record.agent == "workbuddy" for record in records):
+            cleaned = delete_duplicate_workbuddy_records(self.database_path)
+        if changed or cleaned:
             _clear_dashboard_cache()
-        self._json({"ok": True, "records": len(records), "changed": changed})
+        self._json(
+            {
+                "ok": True,
+                "records": len(records),
+                "changed": changed + cleaned,
+                "deduplicated": cleaned,
+            }
+        )
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -213,17 +280,31 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         if not self.server_token:
             return True
         expected = f"Bearer {self.server_token}"
-        if self.headers.get("Authorization") == expected:
+        provided = self.headers.get("Authorization") or ""
+        if hmac.compare_digest(provided, expected):
             return True
-        self.send_response(401)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"error":"unauthorized"}')
+        self._json({"error": "unauthorized"}, status=401)
         return False
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length") or "0")
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise PayloadError(415, "Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError as exc:
+            raise PayloadError(400, "invalid Content-Length") from exc
+        if length <= 0:
+            raise PayloadError(400, "request body is empty")
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise PayloadError(413, "request body is too large")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PayloadError(400, "request body is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise PayloadError(400, "request body must be a JSON object")
+        return payload
 
     def _json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -263,6 +344,13 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         if cache_seconds is not None:
             self.send_header("Cache-Control", f"public, max-age={cache_seconds}")
+        else:
+            self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         if compressed is not body:
             body = compressed
             self.send_header("Content-Encoding", "gzip")
@@ -290,9 +378,75 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         return gzip.compress(body)
 
     def _public_base_url(self) -> str:
-        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "127.0.0.1:18888"
-        proto = self.headers.get("X-Forwarded-Proto") or "http"
-        return f"{proto}://{host}".rstrip("/")
+        host = self.headers.get("Host") or "127.0.0.1:18888"
+        proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",", 1)[0].strip().lower()
+        return _validated_public_base_url(proto, host)
+
+
+class PayloadError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _records_from_payload(payload: dict) -> list[UsageRecord]:
+    try:
+        schema_version = int(payload.get("schema_version", 1))
+    except (TypeError, ValueError) as exc:
+        raise PayloadError(400, "schema_version must be an integer") from exc
+    if schema_version < 1 or schema_version > USAGE_SCHEMA_VERSION:
+        raise PayloadError(400, f"unsupported schema_version: {schema_version}")
+
+    items = payload.get("records")
+    if not isinstance(items, list):
+        raise PayloadError(400, "records must be a JSON array")
+    if len(items) > MAX_RECORDS_PER_REQUEST:
+        raise PayloadError(413, f"request contains more than {MAX_RECORDS_PER_REQUEST} records")
+
+    records: list[UsageRecord] = []
+    now = time.time()
+    for item in items:
+        if not isinstance(item, dict):
+            raise PayloadError(400, "each record must be a JSON object")
+        try:
+            record = UsageRecord.from_dict(item)
+            if schema_version < 2 and record.agent != "codex" and record.reasoning_tokens:
+                record = replace(
+                    record,
+                    output_tokens=max(record.output_tokens - record.reasoning_tokens, 0),
+                )
+            record.validate_for_ingest(now=now)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PayloadError(400, f"invalid usage record: {exc}") from exc
+        records.append(record)
+    return records
+
+
+def _validated_public_base_url(proto: str, host_header: str) -> str:
+    if proto not in {"http", "https"}:
+        raise ValueError("invalid forwarded protocol")
+    if not host_header or any(ord(char) < 33 or ord(char) == 127 for char in host_header):
+        raise ValueError("invalid Host header")
+    parsed = urlparse(f"{proto}://{host_header}")
+    if parsed.username or parsed.password or parsed.path or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("invalid Host header")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("invalid Host header")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid Host header port") from exc
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", hostname):
+            raise ValueError("invalid Host header")
+        rendered_host = hostname.lower()
+    else:
+        rendered_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return f"{proto}://{rendered_host}{f':{port}' if port is not None else ''}"
 
 
 def _strip_app_prefix(path: str) -> str:
@@ -351,22 +505,43 @@ def _manifest_payload() -> dict:
     }
 
 
-def _dashboard_payload(db_path: Path, since: str | None = "all") -> dict:
-    base_rows = daily_summary_db(db_path, since=since, group_by=DASHBOARD_BASE_GROUP)
-    return {
+def _dashboard_payload(
+    db_path: Path,
+    since: str | None = "all",
+    timezone_name: str | None = None,
+) -> dict:
+    base_rows = daily_summary_db(
+        db_path,
+        since=since,
+        group_by=DASHBOARD_BASE_GROUP,
+        timezone_name=timezone_name,
+    )
+    payload = {
         name: _rollup_daily_rows(base_rows, group_by)
         for name, group_by in DASHBOARD_GROUPS.items()
     }
+    payload["hourlyByTool"] = hourly_summary_db(
+        db_path,
+        since=DASHBOARD_HOURLY_SINCE,
+        group_by=("agent",),
+        timezone_name=timezone_name,
+    )
+    payload["meta"] = database_metadata_db(db_path, timezone_name=timezone_name)
+    return payload
 
 
-def _cached_dashboard_payload(db_path: Path, since: str | None = "all") -> dict:
-    key = (str(db_path), since or "")
+def _cached_dashboard_payload(
+    db_path: Path,
+    since: str | None = "all",
+    timezone_name: str | None = None,
+) -> dict:
+    key = (str(db_path), since or "", timezone_name or "")
     now = time.time()
     with _DASHBOARD_CACHE_LOCK:
         cached = _DASHBOARD_CACHE.get(key)
         if cached and now - cached[0] <= DASHBOARD_CACHE_TTL_SECONDS:
             return cached[1]
-    payload = _dashboard_payload(db_path, since=since)
+    payload = _dashboard_payload(db_path, since=since, timezone_name=timezone_name)
     with _DASHBOARD_CACHE_LOCK:
         _DASHBOARD_CACHE[key] = (time.time(), payload)
     return payload
@@ -397,14 +572,31 @@ def _rollup_daily_rows(rows: list[dict[str, object]], group_by: tuple[str, ...])
 
 
 def _source_tarball() -> bytes:
-    root = Path(__file__).resolve().parents[2]
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for rel in ("pyproject.toml", "README.md", "docs/tokenmeter.md", "assets", "scripts", "src", "tests"):
-            path = root / rel
-            if path.exists():
-                tar.add(path, arcname=f"tokenmeter/{rel}", filter=_tar_filter)
-    return buf.getvalue()
+    global _SOURCE_TARBALL_CACHE
+    with _SOURCE_TARBALL_LOCK:
+        if _SOURCE_TARBALL_CACHE is None:
+            root = Path(__file__).resolve().parents[2]
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for rel in (
+                    "pyproject.toml",
+                    "README.md",
+                    "docs/tokenmeter.md",
+                    "assets",
+                    "scripts",
+                    "src",
+                    "tests",
+                ):
+                    path = root / rel
+                    if path.exists():
+                        tar.add(path, arcname=f"tokenmeter/{rel}", filter=_tar_filter)
+            _SOURCE_TARBALL_CACHE = buf.getvalue()
+        return _SOURCE_TARBALL_CACHE
+
+
+def _core_install_script() -> str:
+    path = Path(__file__).resolve().parents[2] / "scripts" / "install.sh"
+    return path.read_text(encoding="utf-8")
 
 
 def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -458,6 +650,9 @@ if [ "$(id -u)" = "0" ] && [ "$OS" = "Linux" ]; then
 else
   INSTALL_DIR="${{TOKENMETER_DIR:-$HOME/.local/share/tokenmeter}}"
 fi
+case "$INSTALL_DIR" in
+  ""|"/") echo "拒绝不安全的安装目录: $INSTALL_DIR" >&2; exit 1 ;;
+esac
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {{ rm -rf "$TMP_DIR"; }}
@@ -474,6 +669,7 @@ RUNNER="$INSTALL_DIR/tokenmeter-upload.sh"
 cat > "$RUNNER" <<EOF_RUNNER
 #!/bin/sh
 set -eu
+umask 077
 TOKENMETER_DIR="$INSTALL_DIR"
 TOKENMETER_PYTHON="$PYTHON_BIN"
 TOKENMETER_SERVER="\\${{TOKENMETER_SERVER:-$TOKENMETER_SERVER}}"
@@ -482,14 +678,12 @@ TOKENMETER_SINCE="\\${{TOKENMETER_SINCE:-$TOKENMETER_SINCE}}"
 TOKENMETER_HOME="\\${{TOKENMETER_HOME:-$TOKENMETER_HOME}}"
 TOKENMETER_AGENTS="\\${{TOKENMETER_AGENTS:-$TOKENMETER_AGENTS}}"
 TOKENMETER_TOKEN="\\${{TOKENMETER_TOKEN:-$TOKENMETER_TOKEN}}"
+export TOKENMETER_TOKEN
 cd "\\$TOKENMETER_DIR"
 set -- "\\$TOKENMETER_PYTHON" -m tokenmeter upload --server "\\$TOKENMETER_SERVER" --host "\\$TOKENMETER_HOST" --since "\\$TOKENMETER_SINCE" --home "\\$TOKENMETER_HOME" --agents "\\$TOKENMETER_AGENTS"
-if [ -n "\\$TOKENMETER_TOKEN" ]; then
-  set -- "\\$@" --token "\\$TOKENMETER_TOKEN"
-fi
 PYTHONPATH="\\$TOKENMETER_DIR/src" exec "\\$@"
 EOF_RUNNER
-chmod +x "$RUNNER"
+chmod 700 "$RUNNER"
 
 PYTHONPATH="$INSTALL_DIR/src" "$PYTHON_BIN" -m tokenmeter --help >/dev/null
 
@@ -551,6 +745,7 @@ Environment=TOKENMETER_AGENTS=$TOKENMETER_AGENTS
 Environment=TOKENMETER_TOKEN=$TOKENMETER_TOKEN
 ExecStart=$RUNNER
 EOF_SERVICE
+  chmod 600 "$USER_DIR/tokenmeter-upload.service"
   cat > "$USER_DIR/tokenmeter-upload.timer" <<EOF_TIMER
 [Unit]
 Description=Upload local token usage to TokenMeter every $TOKENMETER_INTERVAL seconds
@@ -596,6 +791,7 @@ install_launchd() {{
 </dict>
 </plist>
 EOF_PLIST
+  chmod 600 "$PLIST"
   launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   launchctl kickstart -k "gui/$(id -u)/io.tokenmeter.upload" || true
@@ -772,6 +968,82 @@ DASHBOARD_HTML = r"""<!doctype html>
     .usage-panel {
       padding: 26px 22px 24px;
       margin-bottom: 24px;
+    }
+    .hourly-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+    .hourly-chart-scroll {
+      position: relative;
+      margin-top: 20px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      cursor: grab;
+      touch-action: pan-y;
+      scrollbar-color: #cdd3dc transparent;
+      scrollbar-width: thin;
+    }
+    .hourly-chart-scroll.dragging {
+      cursor: grabbing;
+    }
+    .hourly-chart-canvas {
+      position: relative;
+      min-width: 100%;
+      height: 300px;
+    }
+    .hourly-chart {
+      display: block;
+      height: 300px;
+      overflow: visible;
+    }
+    .hourly-grid {
+      stroke: #e0e3e8;
+      stroke-width: 1;
+      stroke-dasharray: 5 5;
+    }
+    .hourly-axis-label {
+      fill: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .hourly-hit {
+      cursor: crosshair;
+    }
+    .hourly-tooltip {
+      position: absolute;
+      z-index: 4;
+      width: max-content;
+      min-width: 158px;
+      max-width: 230px;
+      border-radius: 7px;
+      padding: 10px 12px;
+      color: #ffffff;
+      background: #111827;
+      box-shadow: 0 8px 24px rgba(17, 24, 39, 0.2);
+      font-size: 12px;
+      line-height: 1.45;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 90ms ease;
+    }
+    .hourly-tooltip.show {
+      opacity: 1;
+    }
+    .hourly-tooltip strong,
+    .hourly-tooltip span {
+      display: block;
+    }
+    .hourly-tooltip strong {
+      margin: 2px 0 5px;
+      font-size: 15px;
+    }
+    .hourly-tooltip-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: #d7dce5;
     }
     .share-head {
       display: flex;
@@ -983,7 +1255,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
     .bar-fill {
       height: 100%;
-      min-width: 8px;
+      min-width: 0;
       border-radius: 999px;
       background: var(--other);
     }
@@ -1253,6 +1525,19 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
     </section>
 
+    <section class="panel usage-panel hourly-panel">
+      <div class="hourly-head">
+        <h2 id="hourlyTitle" class="section-title">今日分小时 Token 消耗</h2>
+        <div id="hourlyDate" class="date">--</div>
+      </div>
+      <div id="hourlyChartScroll" class="hourly-chart-scroll" aria-label="分小时 Token 消耗曲线图">
+        <div id="hourlyChartCanvas" class="hourly-chart-canvas">
+          <svg id="hourlyChart" class="hourly-chart" role="img" aria-labelledby="hourlyTitle"></svg>
+          <div id="hourlyTooltip" class="hourly-tooltip" role="status"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="panel rank-panel">
       <h2 id="modelRankTitle" class="section-title">今日按模型</h2>
       <div id="modelRanks" class="rank-list"></div>
@@ -1309,11 +1594,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     const tokenInput = document.getElementById("tokenInput");
     const authPanel = document.getElementById("authPanel");
     const statusEl = document.getElementById("status");
+    let refreshSequence = 0;
     const state = {
       data: null,
-      chartWindow: 30,
-      chartEndIndex: null,
-      chartDays: [],
       modelExpanded: false,
       hostExpanded: false,
       profileExpanded: false,
@@ -1440,10 +1723,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       return `${trim(part / total * 100, 1)}%`;
     }
 
-    function clamp(value, min, max) {
-      return Math.max(min, Math.min(max, value));
-    }
-
     function isoToday() {
       const d = new Date();
       const y = d.getFullYear();
@@ -1519,26 +1798,20 @@ DASHBOARD_HTML = r"""<!doctype html>
       return state.selectedAgent === "all" || toolName(row.agent) === state.selectedAgent;
     }
 
-    function anchorDate() {
-      return isoToday();
+    function anchorDate(data) {
+      return data?.meta?.currentDate || isoToday();
     }
 
     function buildContext(data) {
-      const allDays = continuousDates(data.dailyByTool || [], isoToday());
-      state.chartDays = allDays;
       const option = rangeOption();
-      const last = allDays.length - 1;
-      const anchor = anchorDate();
-      const anchorIndex = Math.max(0, allDays.indexOf(anchor));
-      if (state.chartEndIndex == null || state.chartEndIndex > last) {
-        state.chartEndIndex = clamp(anchorIndex - option.offset, 0, last);
-      }
-      state.chartWindow = option.days;
-      const endIndex = clamp(state.chartEndIndex, 0, last);
-      const startIndex = Math.max(0, endIndex - option.days + 1);
-      const days = allDays.slice(startIndex, endIndex + 1);
+      const endDate = addDays(anchorDate(data), -option.offset);
+      const days = Array.from(
+        {length: option.days},
+        (_value, index) => addDays(endDate, index - option.days + 1)
+      );
       const dateSet = new Set(days);
       const toolRows = (data.dailyByTool || []).filter(row => dateSet.has(row.date) && agentMatches(row));
+      const hourRows = (data.hourlyByTool || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const hostRows = (data.dailyByHost || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const agentModelRows = (data.dailyByAgentModel || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const modelRows = state.selectedAgent === "all"
@@ -1547,7 +1820,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const tools = state.selectedAgent === "all"
         ? actualToolsFromRows(toolRows)
         : [state.selectedAgent];
-      return {option, days, dateSet, toolRows, hostRows, modelRows, tools};
+      return {option, days, dateSet, toolRows, hourRows, hostRows, modelRows, tools, meta: data.meta || {}};
     }
 
     function formatDateRange(context) {
@@ -1585,10 +1858,20 @@ DASHBOARD_HTML = r"""<!doctype html>
       document.getElementById("totalTokens").textContent = compactTokens(total, 2);
       document.getElementById("totalCost").textContent = money(cost);
       document.getElementById("activeDays").textContent = activeDays.toLocaleString("en-US");
-      document.getElementById("syncText").textContent = "最近同步 刚刚";
+      const syncTimestamp = Number(context.meta.lastIngestAt || context.meta.latestTimestamp || 0);
+      document.getElementById("syncText").textContent = formatSyncTime(syncTimestamp);
       document.getElementById("modelRankTitle").textContent = `${context.option.title}按模型`;
       document.getElementById("hostRankTitle").textContent = `${context.option.title}按服务器`;
       document.getElementById("profileRankTitle").textContent = `${context.option.title}按 Profile`;
+    }
+
+    function formatSyncTime(timestamp) {
+      if (!timestamp) return "尚未同步";
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+      if (seconds < 90) return "最近同步 刚刚";
+      if (seconds < 3600) return `最近同步 ${Math.floor(seconds / 60)} 分钟前`;
+      if (seconds < 86400) return `最近同步 ${Math.floor(seconds / 3600)} 小时前`;
+      return `最近同步 ${Math.floor(seconds / 86400)} 天前`;
     }
 
     function renderShare(context) {
@@ -1661,11 +1944,142 @@ DASHBOARD_HTML = r"""<!doctype html>
         return `
           <div class="share-row" title="${escapeHtml(label)}">
             <div class="share-name"><span class="dot" style="background:${rankData.colorFn(row, index)}"></span><span>${escapeHtml(row.name)}</span></div>
-            <div class="bar-track"><div class="bar-fill" style="width:${Math.max(6, row.total_tokens / rankData.max * 100)}%;background:${rankData.colorFn(row, index)}"></div></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${row.total_tokens / rankData.max * 100}%;background:${rankData.colorFn(row, index)}"></div></div>
             <div class="share-value">${value} · ${pct}</div>
           </div>
         `;
       }).join("");
+    }
+
+    function niceAxisMax(value) {
+      const amount = Math.max(Number(value || 0), 1);
+      const magnitude = 10 ** Math.floor(Math.log10(amount));
+      const normalized = amount / magnitude;
+      const factor = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+      return factor * magnitude;
+    }
+
+    function hourlyTickLabel(hour, singleDay) {
+      if (singleDay) return hour.slice(11, 16);
+      return hour.slice(5, 10);
+    }
+
+    function renderHourlyChart(context) {
+      const hours = context.days.flatMap(day => Array.from(
+        {length: 24},
+        (_value, hour) => `${day}T${String(hour).padStart(2, "0")}:00`
+      ));
+      const grouped = new Map(hours.map(hour => [hour, {total: 0, tools: new Map()}]));
+      for (const row of context.hourRows) {
+        if (!grouped.has(row.hour)) continue;
+        const bucket = grouped.get(row.hour);
+        const value = Number(row.total_tokens || 0);
+        const name = toolName(row.agent);
+        bucket.total += value;
+        bucket.tools.set(name, (bucket.tools.get(name) || 0) + value);
+      }
+
+      document.getElementById("hourlyTitle").textContent = `${context.option.title}分小时 Token 消耗`;
+      document.getElementById("hourlyDate").textContent = formatDateRange(context);
+
+      const values = hours.map(hour => grouped.get(hour)?.total || 0);
+      const axisMax = niceAxisMax(Math.max(...values, 0));
+      const pointSpacing = context.option.days === 1 ? 27 : context.option.days <= 3 ? 14 : context.option.days <= 7 ? 8 : 3.2;
+      const width = Math.max(660, Math.round(76 + Math.max(hours.length - 1, 0) * pointSpacing));
+      const height = 300;
+      const left = 58;
+      const right = 18;
+      const top = 22;
+      const bottom = 50;
+      const plotWidth = width - left - right;
+      const plotHeight = height - top - bottom;
+      const xAt = index => left + (hours.length <= 1 ? 0 : index / (hours.length - 1) * plotWidth);
+      const yAt = value => top + (1 - Number(value || 0) / axisMax) * plotHeight;
+      const points = values.map((value, index) => `${xAt(index)},${yAt(value)}`).join(" ");
+      const areaPoints = `${left},${top + plotHeight} ${points} ${left + plotWidth},${top + plotHeight}`;
+      const color = state.selectedAgent === "all" ? "#2f64e6" : colorFor(state.selectedAgent);
+      const labelStep = context.option.days === 1 ? 4 : context.option.days <= 3 ? 12 : context.option.days <= 7 ? 24 : 72;
+      const labelIndexes = new Set([0, hours.length - 1]);
+      for (let index = 0; index < hours.length; index += labelStep) labelIndexes.add(index);
+
+      const grid = [axisMax, axisMax / 2, 0].map(value => {
+        const y = yAt(value);
+        return `
+          <line class="hourly-grid" x1="${left}" y1="${y}" x2="${left + plotWidth}" y2="${y}"></line>
+          <text class="hourly-axis-label" x="${left - 9}" y="${y + 4}" text-anchor="end">${escapeHtml(compactTokens(value, 1))}</text>
+        `;
+      }).join("");
+      const labels = [...labelIndexes].sort((a, b) => a - b).map(index => {
+        const anchor = index === 0 ? "start" : index === hours.length - 1 ? "end" : "middle";
+        return `<text class="hourly-axis-label" x="${xAt(index)}" y="${height - 17}" text-anchor="${anchor}">${escapeHtml(hourlyTickLabel(hours[index], context.option.days === 1))}</text>`;
+      }).join("");
+      const hitWidth = Math.max(5, plotWidth / Math.max(hours.length - 1, 1));
+      const hits = hours.map((hour, index) => `
+        <rect class="hourly-hit" data-index="${index}" x="${xAt(index) - hitWidth / 2}" y="${top}" width="${hitWidth}" height="${plotHeight}" fill="transparent">
+          <title>${escapeHtml(`${hour.replace("T", " ")} ${Number(values[index]).toLocaleString("zh-CN")} tokens`)}</title>
+        </rect>
+      `).join("");
+
+      const canvas = document.getElementById("hourlyChartCanvas");
+      const svg = document.getElementById("hourlyChart");
+      canvas.style.width = `${width}px`;
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.style.width = `${width}px`;
+      svg.innerHTML = `
+        <defs>
+          <linearGradient id="hourlyArea" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="${color}" stop-opacity="0.25"></stop>
+            <stop offset="100%" stop-color="${color}" stop-opacity="0.02"></stop>
+          </linearGradient>
+        </defs>
+        ${grid}
+        <polygon points="${areaPoints}" fill="url(#hourlyArea)"></polygon>
+        <polyline points="${points}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
+        ${values.map((value, index) => value > 0 ? `<circle cx="${xAt(index)}" cy="${yAt(value)}" r="2.5" fill="#ffffff" stroke="${color}" stroke-width="2"></circle>` : "").join("")}
+        ${labels}
+        <g class="hourly-focus" visibility="hidden" pointer-events="none">
+          <line x1="0" y1="${top}" x2="0" y2="${top + plotHeight}" stroke="#687184" stroke-width="1" stroke-dasharray="4 4"></line>
+          <circle cx="0" cy="0" r="5" fill="#ffffff" stroke="${color}" stroke-width="3"></circle>
+        </g>
+        ${hits}
+      `;
+
+      const tooltip = document.getElementById("hourlyTooltip");
+      const focus = svg.querySelector(".hourly-focus");
+      const focusLine = focus.querySelector("line");
+      const focusPoint = focus.querySelector("circle");
+      const showPoint = index => {
+        const hour = hours[index];
+        const bucket = grouped.get(hour);
+        const x = xAt(index);
+        const y = yAt(bucket.total);
+        focus.setAttribute("visibility", "visible");
+        focusLine.setAttribute("x1", x);
+        focusLine.setAttribute("x2", x);
+        focusPoint.setAttribute("cx", x);
+        focusPoint.setAttribute("cy", y);
+        const toolRows = [...bucket.tools.entries()].sort((a, b) => b[1] - a[1]);
+        tooltip.innerHTML = `
+          <span>${escapeHtml(hour.replace("T", " "))} - ${escapeHtml((hour.slice(0, 13) + ":59").replace("T", " "))}</span>
+          <strong>${bucket.total.toLocaleString("zh-CN")} tokens</strong>
+          ${toolRows.map(([name, value]) => `<div class="hourly-tooltip-row"><span>${escapeHtml(name)}</span><span>${Number(value).toLocaleString("zh-CN")}</span></div>`).join("")}
+        `;
+        const below = y < 105;
+        tooltip.style.left = `${Math.max(115, Math.min(width - 115, x))}px`;
+        tooltip.style.top = `${below ? y + 14 : y - 12}px`;
+        tooltip.style.transform = below ? "translate(-50%, 0)" : "translate(-50%, -100%)";
+        tooltip.classList.add("show");
+      };
+      const hidePoint = () => {
+        focus.setAttribute("visibility", "hidden");
+        tooltip.classList.remove("show");
+      };
+      svg.querySelectorAll(".hourly-hit").forEach(hit => {
+        const show = () => showPoint(Number(hit.dataset.index || 0));
+        hit.addEventListener("mouseenter", show);
+        hit.addEventListener("click", show);
+      });
+      svg.addEventListener("mouseleave", hidePoint);
     }
 
     function buildRankRows(rows, keyFn, colorFn) {
@@ -1690,7 +2104,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       return visible.map((row, index) => `
         <div class="rank-row" title="${escapeHtml(`${row.name} ${compactTokens(row.total_tokens, 2)} · ${percent(row.total_tokens, total)}`)}">
           <div>${escapeHtml(row.name)}</div>
-          <div class="bar-track"><div class="bar-fill" style="width:${Math.max(6, row.total_tokens / rankData.max * 100)}%;background:${rankData.colorFn(row, index)}"></div></div>
+          <div class="bar-track"><div class="bar-fill" style="width:${row.total_tokens / rankData.max * 100}%;background:${rankData.colorFn(row, index)}"></div></div>
           <div class="rank-value">${compactTokens(row.total_tokens, 2)} · ${percent(row.total_tokens, rankData.total)}</div>
         </div>
       `).join("") || `<div class="rank-row"><div>暂无数据</div><div class="bar-track"></div><div class="rank-value">--</div></div>`;
@@ -1769,19 +2183,12 @@ DASHBOARD_HTML = r"""<!doctype html>
       }).join("");
     }
 
-    function shiftChartWindow(deltaDays) {
-      if (!state.data || !state.chartDays.length) return;
-      if (rangeOption().days === 1) return;
-      const last = state.chartDays.length - 1;
-      state.chartEndIndex = clamp((state.chartEndIndex ?? last) + deltaDays, 0, last);
-      renderDashboard(state.data);
-    }
-
     function renderDashboard(data) {
       renderFilters(data);
       const context = buildContext(data);
       renderTop(context);
       renderShare(context);
+      renderHourlyChart(context);
       renderRanks(context);
       renderHostRanks(context);
       renderProfileRanks(context);
@@ -1809,7 +2216,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         const button = event.target.closest("button[data-range]");
         if (!button) return;
         state.selectedRange = button.dataset.range;
-        state.chartEndIndex = null;
         state.modelExpanded = false;
         state.hostExpanded = false;
         state.profileExpanded = false;
@@ -1832,52 +2238,48 @@ DASHBOARD_HTML = r"""<!doctype html>
         if (state.data) renderDashboard(state.data);
       });
 
-      const chart = document.querySelector(".chart");
-      if (chart) {
-        let drag = null;
-        chart.addEventListener("pointerdown", event => {
-          if (!state.data) return;
-          if (rangeOption().days === 1) return;
-          drag = {x: event.clientX, endIndex: state.chartEndIndex ?? state.chartDays.length - 1};
-          chart.classList.add("dragging");
-          chart.setPointerCapture(event.pointerId);
-        });
-        chart.addEventListener("pointermove", event => {
-          if (!drag || !state.chartDays.length) return;
-          const step = Math.round((drag.x - event.clientX) / 22);
-          const last = state.chartDays.length - 1;
-          state.chartEndIndex = clamp(drag.endIndex + step, 0, last);
-          renderDashboard(state.data);
-        });
-        for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"]) {
-          chart.addEventListener(eventName, () => {
-            drag = null;
-            chart.classList.remove("dragging");
-          });
-        }
-        chart.addEventListener("wheel", event => {
-          const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-          if (!delta) return;
-          event.preventDefault();
-          shiftChartWindow(Math.sign(delta));
-        }, {passive: false});
-      }
+      const hourlyViewport = document.getElementById("hourlyChartScroll");
+      let dragStart = null;
+      hourlyViewport.addEventListener("pointerdown", event => {
+        if (event.button !== 0) return;
+        dragStart = {x: event.clientX, scrollLeft: hourlyViewport.scrollLeft};
+        hourlyViewport.classList.add("dragging");
+        hourlyViewport.setPointerCapture(event.pointerId);
+      });
+      hourlyViewport.addEventListener("pointermove", event => {
+        if (!dragStart) return;
+        hourlyViewport.scrollLeft = dragStart.scrollLeft - (event.clientX - dragStart.x);
+      });
+      const stopDragging = event => {
+        dragStart = null;
+        hourlyViewport.classList.remove("dragging");
+        if (hourlyViewport.hasPointerCapture(event.pointerId)) hourlyViewport.releasePointerCapture(event.pointerId);
+      };
+      hourlyViewport.addEventListener("pointerup", stopDragging);
+      hourlyViewport.addEventListener("pointercancel", stopDragging);
+
     }
 
     async function refresh() {
+      const sequence = ++refreshSequence;
       setStatus("加载中...");
       try {
-        const payload = await api("/api/v1/dashboard?since=all");
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+        const payload = await api(`/api/v1/dashboard?since=all&timezone=${encodeURIComponent(timezone)}`);
+        if (sequence !== refreshSequence) return;
         const data = {
           dailyByTool: payload.dailyByTool || [],
           dailyByModel: payload.dailyByModel || [],
           dailyByAgentModel: payload.dailyByAgentModel || [],
-          dailyByHost: payload.dailyByHost || []
+          dailyByHost: payload.dailyByHost || [],
+          hourlyByTool: payload.hourlyByTool || [],
+          meta: payload.meta || {}
         };
         state.data = data;
         renderDashboard(data);
         setStatus("");
       } catch (err) {
+        if (sequence !== refreshSequence) return;
         setStatus(err.message || String(err), true);
       }
     }

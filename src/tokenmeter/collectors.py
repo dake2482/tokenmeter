@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import socket
 import sqlite3
@@ -17,6 +18,8 @@ TOKEN_FIELDS = {
     "cache_write_tokens",
     "reasoning_tokens",
 }
+SUPPORTED_AGENTS = {"hermes", "openclaw", "codex", "zcode", "workbuddy", "claude", "claudecode"}
+WORKBUDDY_DUPLICATE_WINDOW_SECONDS = 300
 
 
 def collect_all(
@@ -31,6 +34,9 @@ def collect_all(
         agent.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
         for agent in (agents or ("hermes", "openclaw", "codex", "zcode", "workbuddy", "claude"))
     }
+    unknown = sorted(wanted - SUPPORTED_AGENTS)
+    if unknown:
+        raise ValueError(f"unsupported agents: {', '.join(unknown)}")
     records: list[UsageRecord] = []
     if "hermes" in wanted:
         records.extend(collect_hermes(home_path, host_name, since))
@@ -143,6 +149,7 @@ def collect_zcode(home: Path, host: str, since: float | None = None) -> list[Usa
         cache_read = _int(data.get("cache_read_input_tokens"))
         cache_write = _int(data.get("cache_creation_input_tokens"))
         raw_input = _int(data.get("input_tokens"))
+        reasoning = _int(data.get("reasoning_tokens"))
         records.append(
             UsageRecord(
                 record_id=f"zcode:{data.get('id')}",
@@ -157,31 +164,67 @@ def collect_zcode(home: Path, host: str, since: float | None = None) -> list[Usa
                 started_at=_parse_time(data.get("started_at")) if data.get("started_at") is not None else None,
                 ended_at=timestamp,
                 input_tokens=max(raw_input - cache_read - cache_write, 0),
-                output_tokens=_int(data.get("output_tokens")),
+                output_tokens=_exclusive_output_tokens(data.get("output_tokens"), reasoning),
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
-                reasoning_tokens=_int(data.get("reasoning_tokens")),
+                reasoning_tokens=reasoning,
             )
         )
     return records
 
 
 def collect_workbuddy(home: Path, host: str, since: float | None = None) -> list[UsageRecord]:
-    records: list[UsageRecord] = []
+    project_records: list[UsageRecord] = []
     root = home / ".workbuddy" / "projects"
     if root.exists():
         for path in sorted(root.glob("**/*.jsonl")):
             if since is not None and _mtime_before(path, since):
                 continue
-            records.extend(_collect_workbuddy_jsonl(path, host, since))
+            project_records.extend(_collect_workbuddy_jsonl(path, host, since))
 
+    trace_records: list[UsageRecord] = []
     trace_root = home / ".workbuddy" / "traces"
     if trace_root.exists():
         for path in sorted(trace_root.glob("**/*.json")):
             if since is not None and _mtime_before(path, since):
                 continue
-            records.extend(_collect_workbuddy_trace_json(path, host, since))
-    return records
+            trace_records.extend(_collect_workbuddy_trace_json(path, host, since))
+    return [*project_records, *_deduplicate_workbuddy_traces(project_records, trace_records)]
+
+
+def _deduplicate_workbuddy_traces(
+    project_records: list[UsageRecord],
+    trace_records: list[UsageRecord],
+) -> list[UsageRecord]:
+    candidates: dict[tuple[object, ...], list[tuple[int, UsageRecord]]] = {}
+    for index, record in enumerate(project_records):
+        candidates.setdefault(_workbuddy_usage_fingerprint(record), []).append((index, record))
+
+    consumed: set[int] = set()
+    unique_traces: list[UsageRecord] = []
+    for trace_record in trace_records:
+        matches = [
+            (abs(project.timestamp - trace_record.timestamp), index)
+            for index, project in candidates.get(_workbuddy_usage_fingerprint(trace_record), [])
+            if index not in consumed
+            and abs(project.timestamp - trace_record.timestamp) <= WORKBUDDY_DUPLICATE_WINDOW_SECONDS
+        ]
+        if matches:
+            _, matched_index = min(matches)
+            consumed.add(matched_index)
+            continue
+        unique_traces.append(trace_record)
+    return unique_traces
+
+
+def _workbuddy_usage_fingerprint(record: UsageRecord) -> tuple[object, ...]:
+    return (
+        record.model.lower(),
+        record.input_tokens,
+        record.cache_read_tokens,
+        record.cache_write_tokens,
+        record.total_tokens,
+    )
 
 
 def collect_claude_code(home: Path, host: str, since: float | None = None) -> list[UsageRecord]:
@@ -250,7 +293,8 @@ def _collect_hermes_db(
         if not {"id", "started_at"}.issubset(cols):
             return []
         selected = sorted(cols & _HERMES_COLUMNS)
-        where = "where started_at >= ?" if since is not None else ""
+        timestamp_expression = "coalesce(ended_at, started_at)" if "ended_at" in cols else "started_at"
+        where = f"where {timestamp_expression} >= ?" if since is not None else ""
         params = (since,) if since is not None else ()
         query = f"select {', '.join(selected)} from sessions {where}"
         rows = conn.execute(query, params).fetchall()
@@ -264,6 +308,7 @@ def _collect_hermes_db(
         data = dict(row)
         started_at = _float(data.get("started_at"))
         ended_at = _optional_float(data.get("ended_at"))
+        reasoning = _int(data.get("reasoning_tokens"))
         total_tokens = sum(_int(data.get(field)) for field in TOKEN_FIELDS)
         if total_tokens <= 0:
             continue
@@ -281,10 +326,10 @@ def _collect_hermes_db(
                 started_at=started_at,
                 ended_at=ended_at,
                 input_tokens=_int(data.get("input_tokens")),
-                output_tokens=_int(data.get("output_tokens")),
+                output_tokens=_exclusive_output_tokens(data.get("output_tokens"), reasoning),
                 cache_read_tokens=_int(data.get("cache_read_tokens")),
                 cache_write_tokens=_int(data.get("cache_write_tokens")),
-                reasoning_tokens=_int(data.get("reasoning_tokens")),
+                reasoning_tokens=reasoning,
                 estimated_cost_usd=_optional_float(data.get("estimated_cost_usd")),
             )
         )
@@ -363,6 +408,10 @@ def _collect_codex_rollout_jsonl(
             except json.JSONDecodeError:
                 continue
             payload = _as_dict(event.get("payload"))
+            if event.get("type") == "turn_context":
+                model = str(payload.get("model") or model)
+                profile = _profile_from_cwd(payload.get("cwd")) or profile
+                continue
             if payload.get("type") != "token_count":
                 continue
             info = _as_dict(payload.get("info"))
@@ -430,6 +479,8 @@ def _collect_openclaw_jsonl(
             if since is not None and timestamp < since:
                 continue
             session_id = str(event.get("sessionId") or path.stem.replace(".trajectory", ""))
+            reasoning = _int(usage.get("reasoning"))
+            output = _openclaw_output_tokens(usage, reasoning)
             records.append(
                 UsageRecord(
                     record_id=f"openclaw:v2:{profile}:{path.name}:{line_no}",
@@ -444,10 +495,10 @@ def _collect_openclaw_jsonl(
                     started_at=timestamp,
                     ended_at=timestamp,
                     input_tokens=_int(usage.get("input")),
-                    output_tokens=_int(usage.get("output")),
+                    output_tokens=output,
                     cache_read_tokens=_int(usage.get("cacheRead")),
                     cache_write_tokens=_int(usage.get("cacheWrite")),
-                    reasoning_tokens=_int(usage.get("reasoning")),
+                    reasoning_tokens=reasoning,
                     estimated_cost_usd=_optional_float(
                         (usage.get("cost") or {}).get("total")
                         if isinstance(usage.get("cost"), dict)
@@ -649,10 +700,7 @@ def _workbuddy_tool_output_usage(value: object) -> tuple[dict[str, int], str]:
 
     total = {field: 0 for field in TOKEN_FIELDS}
     model = ""
-    for item in _walk_json_objects(payload):
-        usage = _as_dict(item.get("usage"))
-        if not usage:
-            continue
+    for item, usage in _walk_usage_objects(payload):
         tokens = _usage_from_unknown(usage)
         if sum(_int(tokens.get(field)) for field in TOKEN_FIELDS) <= 0:
             continue
@@ -677,13 +725,14 @@ def _usage_from_snake(usage: dict, subtract_cache: bool) -> dict[str, int]:
     cache_read = _int(usage.get("cache_read_tokens") or usage.get("cache_read_input_tokens"))
     cache_write = _int(usage.get("cache_write_tokens") or usage.get("cache_creation_input_tokens"))
     raw_input = _int(usage.get("input_tokens"))
+    reasoning = _int(usage.get("reasoning_tokens") or usage.get("reasoning_output_tokens"))
     input_tokens = max(raw_input - cache_read - cache_write, 0) if subtract_cache else raw_input
     return {
         "input_tokens": input_tokens,
-        "output_tokens": _int(usage.get("output_tokens")),
+        "output_tokens": _exclusive_output_tokens(usage.get("output_tokens"), reasoning),
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
-        "reasoning_tokens": _int(usage.get("reasoning_tokens")),
+        "reasoning_tokens": reasoning,
     }
 
 
@@ -698,13 +747,16 @@ def _usage_from_camel(usage: dict) -> dict[str, int]:
         "cacheWriteTokens",
     )
     raw_input = _int(usage.get("inputTokens") or usage.get("input_tokens") or usage.get("promptTokens"))
-    output_tokens = _int(usage.get("outputTokens") or usage.get("output_tokens") or usage.get("completionTokens"))
+    reasoning = _sum_details(output_details, "reasoning_tokens", "reasoningTokens")
     return {
         "input_tokens": max(raw_input - cache_read - cache_write, 0),
-        "output_tokens": output_tokens,
+        "output_tokens": _exclusive_output_tokens(
+            usage.get("outputTokens") or usage.get("output_tokens") or usage.get("completionTokens"),
+            reasoning,
+        ),
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
-        "reasoning_tokens": _sum_details(output_details, "reasoning_tokens", "reasoningTokens"),
+        "reasoning_tokens": reasoning,
     }
 
 
@@ -716,13 +768,37 @@ def _usage_from_raw(usage: dict) -> dict[str, int]:
     cache_write = _int(usage.get("cache_creation_input_tokens"))
     cache_write = cache_write or _sum_details(prompt_details, "cache_creation_input_tokens", "cache_write_tokens")
     raw_input = _int(usage.get("input_tokens") or usage.get("prompt_tokens"))
+    reasoning = _sum_details(completion_details, "reasoning_tokens")
     return {
         "input_tokens": max(raw_input - cache_read - cache_write, 0),
-        "output_tokens": _int(usage.get("output_tokens") or usage.get("completion_tokens")),
+        "output_tokens": _exclusive_output_tokens(
+            usage.get("output_tokens") or usage.get("completion_tokens"),
+            reasoning,
+        ),
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
-        "reasoning_tokens": _sum_details(completion_details, "reasoning_tokens"),
+        "reasoning_tokens": reasoning,
     }
+
+
+def _exclusive_output_tokens(output_value: object, reasoning_tokens: int) -> int:
+    return max(_int(output_value) - reasoning_tokens, 0)
+
+
+def _openclaw_output_tokens(usage: dict, reasoning_tokens: int) -> int:
+    output = _int(usage.get("output"))
+    if reasoning_tokens <= 0:
+        return output
+    declared_total = _int(usage.get("total") or usage.get("totalTokens"))
+    total_without_reasoning = (
+        _int(usage.get("input"))
+        + output
+        + _int(usage.get("cacheRead"))
+        + _int(usage.get("cacheWrite"))
+    )
+    if declared_total and declared_total == total_without_reasoning + reasoning_tokens:
+        return output
+    return max(output - reasoning_tokens, 0)
 
 
 def _sum_details(details: object, *keys: str) -> int:
@@ -741,14 +817,17 @@ def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _walk_json_objects(value: object):
+def _walk_usage_objects(value: object):
     if isinstance(value, dict):
-        yield value
+        usage = _as_dict(value.get("usage"))
+        if usage:
+            yield value, usage
+            return
         for child in value.values():
-            yield from _walk_json_objects(child)
+            yield from _walk_usage_objects(child)
     elif isinstance(value, list):
         for child in value:
-            yield from _walk_json_objects(child)
+            yield from _walk_usage_objects(child)
 
 
 def _openclaw_source(event: dict) -> str:
@@ -765,14 +844,14 @@ def _openclaw_source(event: dict) -> str:
 def _parse_time(value: object) -> float:
     if isinstance(value, (int, float)):
         number = float(value)
-        return number / 1000 if number > 10_000_000_000 else number
+        return _normalize_timestamp(number)
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return 0
         try:
             number = float(text)
-            return number / 1000 if number > 10_000_000_000 else number
+            return _normalize_timestamp(number)
         except ValueError:
             return _parse_ts(text)
     return 0
@@ -796,30 +875,34 @@ def _newest_existing(*paths: Path) -> Path | None:
     existing = [path for path in paths if path.exists()]
     if not existing:
         return None
-    return max(existing, key=lambda path: path.stat().st_mtime)
+    try:
+        return max(existing, key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return None
 
 
 def _parse_ts(value: object) -> float:
     if isinstance(value, (int, float)):
-        return float(value)
+        return _normalize_timestamp(float(value))
     if not isinstance(value, str) or not value:
         return 0
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        return _normalize_timestamp(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except ValueError:
         return 0
 
 
 def _int(value: object) -> int:
     try:
-        return int(value or 0)
+        return max(int(value or 0), 0)
     except (TypeError, ValueError):
         return 0
 
 
 def _float(value: object) -> float:
     try:
-        return float(value or 0)
+        number = float(value or 0)
+        return number if math.isfinite(number) and number >= 0 else 0
     except (TypeError, ValueError):
         return 0
 
@@ -828,6 +911,13 @@ def _optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_timestamp(value: float) -> float:
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    return value / 1000 if value > 10_000_000_000 else value

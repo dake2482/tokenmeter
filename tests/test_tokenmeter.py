@@ -12,7 +12,7 @@ from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
 from tokenmeter.records import UsageRecord
 from tokenmeter.server import _asset_name_for_path, _dashboard_payload, _manifest_payload, _strip_app_prefix
-from tokenmeter.storage import daily_summary_db, upsert_records
+from tokenmeter.storage import daily_summary_db, hourly_summary_db, upsert_records
 from tokenmeter.summary import summarize_records
 
 
@@ -118,6 +118,30 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(rows[0]["model"], "GLM-5.2")
         self.assertEqual(rows[0]["total_tokens"], 30)
 
+    def test_hourly_summary_groups_real_records_by_local_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "tokenmeter.sqlite"
+            upsert_records(
+                db_path,
+                [
+                    _usage_record("a", "GPT-5.5", 10, timestamp=1_000, agent="codex"),
+                    _usage_record("b", "GPT-5.5", 20, timestamp=1_800, agent="codex"),
+                    _usage_record("c", "GLM-5.2", 30, timestamp=3_700, agent="hermes"),
+                ],
+            )
+
+            rows = hourly_summary_db(
+                db_path,
+                since="all",
+                group_by=("agent",),
+                timezone_name="UTC",
+            )
+
+        by_hour_agent = {(row["hour"], row["agent"]): row for row in rows}
+        self.assertEqual(by_hour_agent[("1970-01-01T00:00", "codex")]["total_tokens"], 30)
+        self.assertEqual(by_hour_agent[("1970-01-01T01:00", "hermes")]["total_tokens"], 30)
+        self.assertEqual(by_hour_agent[("1970-01-01T01:00", "hermes")]["date"], "1970-01-01")
+
     def test_dashboard_payload_combines_home_page_series(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -128,10 +152,14 @@ class TokenMeterTests(unittest.TestCase):
 
             payload = _dashboard_payload(db_path, since="all")
 
-        self.assertEqual(set(payload), {"dailyByTool", "dailyByModel", "dailyByAgentModel", "dailyByHost"})
+        self.assertEqual(
+            set(payload),
+            {"dailyByTool", "dailyByModel", "dailyByAgentModel", "dailyByHost", "hourlyByTool", "meta"},
+        )
         self.assertTrue(payload["dailyByTool"])
         self.assertTrue(payload["dailyByModel"])
         self.assertTrue(payload["dailyByHost"])
+        self.assertIsInstance(payload["hourlyByTool"], list)
 
     def test_openclaw_duplicate_seq_events_have_distinct_record_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,7 +190,7 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(by_agent["codex"].profile, "Project")
         self.assertEqual(by_agent["zcode"].total_tokens, 120)
         self.assertEqual(by_agent["zcode"].input_tokens, 60)
-        self.assertEqual(by_agent["workbuddy"].total_tokens, 345)
+        self.assertEqual(by_agent["workbuddy"].total_tokens, 340)
         self.assertEqual(by_agent["workbuddy"].cache_read_tokens, 100)
         self.assertEqual(by_agent["claude"].total_tokens, 67)
 
@@ -179,7 +207,7 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(records[0].model, "GPT-5.5")
         self.assertEqual(records[0].input_tokens, 70)
         self.assertEqual(records[0].cache_read_tokens, 20)
-        self.assertEqual(records[0].output_tokens, 30)
+        self.assertEqual(records[0].output_tokens, 20)
         self.assertEqual(records[0].reasoning_tokens, 10)
 
     def test_codex_uses_newest_state_database(self) -> None:
@@ -226,17 +254,23 @@ class TokenMeterTests(unittest.TestCase):
             self.assertNotIn(address, readme)
 
 
-def _usage_record(record_id: str, model: str, tokens: int) -> UsageRecord:
+def _usage_record(
+    record_id: str,
+    model: str,
+    tokens: int,
+    timestamp: float = 0,
+    agent: str = "test",
+) -> UsageRecord:
     return UsageRecord(
         record_id=record_id,
         host="test-host",
-        agent="test",
+        agent=agent,
         profile="default",
         source="test",
         session_id=record_id,
         provider="test",
         model=model,
-        timestamp=0,
+        timestamp=timestamp,
         input_tokens=tokens,
     )
 

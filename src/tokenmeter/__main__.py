@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import socket
 import sys
@@ -14,11 +15,16 @@ from .server import run_server
 from .storage import (
     delete_legacy_codex_records,
     delete_legacy_openclaw_records,
+    delete_duplicate_workbuddy_records,
     delete_zero_token_records,
     summarize_db,
     upsert_records,
 )
 from .summary import DEFAULT_GROUP_BY, format_table, summarize_records
+
+
+USAGE_SCHEMA_VERSION = 2
+UPLOAD_BATCH_SIZE = 2_000
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -114,15 +120,35 @@ def _cmd_collect(args: argparse.Namespace) -> int:
 
 def _cmd_upload(args: argparse.Namespace) -> int:
     records = _collect_from_args(args)
-    payload = json.dumps({"records": [record.to_dict() for record in records]}, ensure_ascii=False).encode("utf-8")
     url = args.server.rstrip("/") + "/api/v1/usage"
+    batches = [records[index:index + UPLOAD_BATCH_SIZE] for index in range(0, len(records), UPLOAD_BATCH_SIZE)]
+    if not batches:
+        batches = [[]]
+    changed = 0
+    for batch in batches:
+        response = _upload_records(url, batch, args.token)
+        changed += int(response.get("changed") or 0)
+    print(json.dumps({"ok": True, "records": len(records), "changed": changed, "batches": len(batches)}))
+    return 0
+
+
+def _upload_records(url: str, records: list, token: str | None) -> dict:
+    payload = json.dumps(
+        {
+            "schema_version": USAGE_SCHEMA_VERSION,
+            "records": [record.to_dict() for record in records],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
     req = request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
-    if args.token:
-        req.add_header("Authorization", f"Bearer {args.token}")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     with request.urlopen(req, timeout=30) as resp:
         body = resp.read().decode("utf-8")
-    print(body)
-    return 0
+    response = json.loads(body)
+    if not isinstance(response, dict) or not response.get("ok"):
+        raise RuntimeError("TokenMeter server returned an invalid response")
+    return response
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -153,6 +179,8 @@ def _cmd_import(args: argparse.Namespace) -> int:
     if "openclaw" in agents:
         cleaned += delete_legacy_openclaw_records(args.db)
     changed = upsert_records(args.db, records)
+    if "workbuddy" in agents:
+        cleaned += delete_duplicate_workbuddy_records(args.db)
     print(f"stored {len(records)} records ({changed + cleaned} changed, {cleaned} legacy cleaned) in {args.db}")
     return 0
 
@@ -184,7 +212,10 @@ def _parse_duration_seconds(value: str | int | float | None) -> float:
     if value is None:
         return 0
     if isinstance(value, int | float):
-        return float(value)
+        amount = float(value)
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError("duration must be a finite non-negative number")
+        return amount
     text = value.strip().lower()
     if not text:
         return 0
@@ -192,8 +223,12 @@ def _parse_duration_seconds(value: str | int | float | None) -> float:
         return 0
     if text[-1:] in {"s", "m", "h", "d"}:
         amount = float(text[:-1])
-        return amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[text[-1]]
-    return float(text)
+        seconds = amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[text[-1]]
+    else:
+        seconds = float(text)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("duration must be a finite non-negative number")
+    return seconds
 
 
 if __name__ == "__main__":
