@@ -25,7 +25,7 @@ from .storage import (
     delete_legacy_openclaw_records,
     delete_duplicate_workbuddy_records,
     delete_zero_token_records,
-    hourly_summary_db,
+    interval_summary_db,
     summarize_db,
     upsert_records,
 )
@@ -45,7 +45,7 @@ DASHBOARD_GROUPS = {
     "dailyByHost": ("host", "agent"),
 }
 DASHBOARD_BASE_GROUP = ("host", "agent", "profile", "model")
-DASHBOARD_HOURLY_SINCE = "31d"
+DASHBOARD_TREND_SINCE = "61d"
 DASHBOARD_CACHE_TTL_SECONDS = 30.0
 MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 MAX_RECORDS_PER_REQUEST = 5_000
@@ -520,12 +520,21 @@ def _dashboard_payload(
         name: _rollup_daily_rows(base_rows, group_by)
         for name, group_by in DASHBOARD_GROUPS.items()
     }
-    payload["hourlyByTool"] = hourly_summary_db(
-        db_path,
-        since=DASHBOARD_HOURLY_SINCE,
-        group_by=("agent",),
-        timezone_name=timezone_name,
-    )
+    payload["intervalByTool"] = [
+        {
+            "interval": row["interval"],
+            "date": row["date"],
+            "agent": row["agent"],
+            "total_tokens": row["total_tokens"],
+        }
+        for row in interval_summary_db(
+            db_path,
+            since=DASHBOARD_TREND_SINCE,
+            group_by=("agent",),
+            timezone_name=timezone_name,
+            interval_minutes=15,
+        )
+    ]
     payload["meta"] = database_metadata_db(db_path, timezone_name=timezone_name)
     return payload
 
@@ -975,6 +984,31 @@ DASHBOARD_HTML = r"""<!doctype html>
       justify-content: space-between;
       gap: 18px;
     }
+    .trend-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 22px;
+      margin-top: 14px;
+      color: #687184;
+      font-size: 14px;
+      font-weight: 750;
+    }
+    .trend-legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .trend-line-swatch {
+      width: 26px;
+      height: 0;
+      border-top: 3px solid var(--codex);
+      flex: 0 0 auto;
+    }
+    .trend-line-swatch.previous {
+      border-top-color: #9aa3b2;
+      border-top-style: dashed;
+    }
     .hourly-chart-scroll {
       position: relative;
       margin-top: 20px;
@@ -1412,7 +1446,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     @media (max-width: 560px) {
       html, body { overflow-x: hidden; }
       .page { width: 100%; padding: 10px 10px 24px; }
-      .today-head { align-items: flex-start; flex-direction: column; }
+      .today-head, .hourly-head { align-items: flex-start; flex-direction: column; }
       .today-panel, .usage-panel, .rank-panel, .detail-panel {
         padding: 18px 14px;
         border-radius: 12px;
@@ -1527,10 +1561,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     <section class="panel usage-panel hourly-panel">
       <div class="hourly-head">
-        <h2 id="hourlyTitle" class="section-title">今日分小时 Token 消耗</h2>
+        <h2 id="hourlyTitle" class="section-title">今日每 15 分钟 Token 消耗</h2>
         <div id="hourlyDate" class="date">--</div>
       </div>
-      <div id="hourlyChartScroll" class="hourly-chart-scroll" aria-label="分小时 Token 消耗曲线图">
+      <div id="trendLegend" class="trend-legend" aria-label="趋势图图例"></div>
+      <div id="hourlyChartScroll" class="hourly-chart-scroll" aria-label="每 15 分钟 Token 消耗对比曲线图">
         <div id="hourlyChartCanvas" class="hourly-chart-canvas">
           <svg id="hourlyChart" class="hourly-chart" role="img" aria-labelledby="hourlyTitle"></svg>
           <div id="hourlyTooltip" class="hourly-tooltip" role="status"></div>
@@ -1810,8 +1845,10 @@ DASHBOARD_HTML = r"""<!doctype html>
         (_value, index) => addDays(endDate, index - option.days + 1)
       );
       const dateSet = new Set(days);
+      const comparisonDays = days.map(day => addDays(day, -option.days));
+      const trendDateSet = new Set([...days, ...comparisonDays]);
       const toolRows = (data.dailyByTool || []).filter(row => dateSet.has(row.date) && agentMatches(row));
-      const hourRows = (data.hourlyByTool || []).filter(row => dateSet.has(row.date) && agentMatches(row));
+      const intervalRows = (data.intervalByTool || []).filter(row => trendDateSet.has(row.date) && agentMatches(row));
       const hostRows = (data.dailyByHost || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const agentModelRows = (data.dailyByAgentModel || []).filter(row => dateSet.has(row.date) && agentMatches(row));
       const modelRows = state.selectedAgent === "all"
@@ -1820,7 +1857,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const tools = state.selectedAgent === "all"
         ? actualToolsFromRows(toolRows)
         : [state.selectedAgent];
-      return {option, days, dateSet, toolRows, hourRows, hostRows, modelRows, tools, meta: data.meta || {}};
+      return {option, days, comparisonDays, dateSet, toolRows, intervalRows, hostRows, modelRows, tools, meta: data.meta || {}};
     }
 
     function formatDateRange(context) {
@@ -1959,33 +1996,62 @@ DASHBOARD_HTML = r"""<!doctype html>
       return factor * magnitude;
     }
 
-    function hourlyTickLabel(hour, singleDay) {
-      if (singleDay) return hour.slice(11, 16);
-      return hour.slice(5, 10);
+    function trendTickLabel(interval, singleDay) {
+      if (singleDay) return interval.slice(11, 16);
+      return interval.slice(5, 10);
+    }
+
+    function trendSlots(days) {
+      return days.flatMap(day => Array.from({length: 96}, (_value, index) => {
+        const hour = String(Math.floor(index / 4)).padStart(2, "0");
+        const minute = String(index % 4 * 15).padStart(2, "0");
+        return `${day}T${hour}:${minute}`;
+      }));
+    }
+
+    function comparisonLabel(option) {
+      if (option.id === "today") return "昨日";
+      if (option.id === "yesterday") return "前日";
+      if (option.id === "prevday") return "上一日";
+      return "上一周期";
+    }
+
+    function smoothPath(points) {
+      if (!points.length) return "";
+      let path = `M ${points[0].x},${points[0].y}`;
+      for (let index = 1; index < points.length; index += 1) {
+        const previous = points[index - 1];
+        const current = points[index];
+        const midpoint = (previous.x + current.x) / 2;
+        path += ` C ${midpoint},${previous.y} ${midpoint},${current.y} ${current.x},${current.y}`;
+      }
+      return path;
     }
 
     function renderHourlyChart(context) {
-      const hours = context.days.flatMap(day => Array.from(
-        {length: 24},
-        (_value, hour) => `${day}T${String(hour).padStart(2, "0")}:00`
-      ));
-      const grouped = new Map(hours.map(hour => [hour, {total: 0, tools: new Map()}]));
-      for (const row of context.hourRows) {
-        if (!grouped.has(row.hour)) continue;
-        const bucket = grouped.get(row.hour);
+      const currentSlots = trendSlots(context.days);
+      const previousSlots = trendSlots(context.comparisonDays);
+      const allSlots = new Set([...currentSlots, ...previousSlots]);
+      const grouped = new Map([...allSlots].map(interval => [interval, {total: 0, tools: new Map()}]));
+      for (const row of context.intervalRows) {
+        if (!grouped.has(row.interval)) continue;
+        const bucket = grouped.get(row.interval);
         const value = Number(row.total_tokens || 0);
         const name = toolName(row.agent);
         bucket.total += value;
         bucket.tools.set(name, (bucket.tools.get(name) || 0) + value);
       }
 
-      document.getElementById("hourlyTitle").textContent = `${context.option.title}分小时 Token 消耗`;
+      const currentLabel = context.option.title;
+      const previousLabel = comparisonLabel(context.option);
+      document.getElementById("hourlyTitle").textContent = `${currentLabel}每 15 分钟 Token 消耗`;
       document.getElementById("hourlyDate").textContent = formatDateRange(context);
 
-      const values = hours.map(hour => grouped.get(hour)?.total || 0);
-      const axisMax = niceAxisMax(Math.max(...values, 0));
-      const pointSpacing = context.option.days === 1 ? 27 : context.option.days <= 3 ? 14 : context.option.days <= 7 ? 8 : 3.2;
-      const width = Math.max(660, Math.round(76 + Math.max(hours.length - 1, 0) * pointSpacing));
+      const currentValues = currentSlots.map(interval => grouped.get(interval)?.total || 0);
+      const previousValues = previousSlots.map(interval => grouped.get(interval)?.total || 0);
+      const axisMax = niceAxisMax(Math.max(...currentValues, ...previousValues, 0));
+      const pointSpacing = context.option.days === 1 ? 7 : context.option.days <= 3 ? 3.5 : context.option.days <= 7 ? 2.4 : 1.2;
+      const width = Math.max(660, Math.round(76 + Math.max(currentSlots.length - 1, 0) * pointSpacing));
       const height = 300;
       const left = 58;
       const right = 18;
@@ -1993,14 +2059,23 @@ DASHBOARD_HTML = r"""<!doctype html>
       const bottom = 50;
       const plotWidth = width - left - right;
       const plotHeight = height - top - bottom;
-      const xAt = index => left + (hours.length <= 1 ? 0 : index / (hours.length - 1) * plotWidth);
+      const xAt = index => left + (currentSlots.length <= 1 ? 0 : index / (currentSlots.length - 1) * plotWidth);
       const yAt = value => top + (1 - Number(value || 0) / axisMax) * plotHeight;
-      const points = values.map((value, index) => `${xAt(index)},${yAt(value)}`).join(" ");
-      const areaPoints = `${left},${top + plotHeight} ${points} ${left + plotWidth},${top + plotHeight}`;
+      const currentPoints = currentValues.map((value, index) => ({x: xAt(index), y: yAt(value)}));
+      const previousPoints = previousValues.map((value, index) => ({x: xAt(index), y: yAt(value)}));
+      const currentPath = smoothPath(currentPoints);
+      const previousPath = smoothPath(previousPoints);
+      const areaPath = `${currentPath} L ${left + plotWidth},${top + plotHeight} L ${left},${top + plotHeight} Z`;
       const color = state.selectedAgent === "all" ? "#2f64e6" : colorFor(state.selectedAgent);
-      const labelStep = context.option.days === 1 ? 4 : context.option.days <= 3 ? 12 : context.option.days <= 7 ? 24 : 72;
-      const labelIndexes = new Set([0, hours.length - 1]);
-      for (let index = 0; index < hours.length; index += labelStep) labelIndexes.add(index);
+      const previousColor = "#9aa3b2";
+      const labelStep = context.option.days === 1 ? 16 : context.option.days <= 3 ? 48 : context.option.days <= 7 ? 96 : 288;
+      const labelIndexes = new Set([0, currentSlots.length - 1]);
+      for (let index = 0; index < currentSlots.length; index += labelStep) labelIndexes.add(index);
+
+      document.getElementById("trendLegend").innerHTML = `
+        <span class="trend-legend-item"><span class="trend-line-swatch" style="border-top-color:${color}"></span><span>${escapeHtml(currentLabel)} · ${escapeHtml(formatDateRange({days: context.days}))}</span></span>
+        <span class="trend-legend-item"><span class="trend-line-swatch previous"></span><span>${escapeHtml(previousLabel)} · ${escapeHtml(formatDateRange({days: context.comparisonDays}))}</span></span>
+      `;
 
       const grid = [axisMax, axisMax / 2, 0].map(value => {
         const y = yAt(value);
@@ -2010,15 +2085,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         `;
       }).join("");
       const labels = [...labelIndexes].sort((a, b) => a - b).map(index => {
-        const anchor = index === 0 ? "start" : index === hours.length - 1 ? "end" : "middle";
-        return `<text class="hourly-axis-label" x="${xAt(index)}" y="${height - 17}" text-anchor="${anchor}">${escapeHtml(hourlyTickLabel(hours[index], context.option.days === 1))}</text>`;
+        const anchor = index === 0 ? "start" : index === currentSlots.length - 1 ? "end" : "middle";
+        return `<text class="hourly-axis-label" x="${xAt(index)}" y="${height - 17}" text-anchor="${anchor}">${escapeHtml(trendTickLabel(currentSlots[index], context.option.days === 1))}</text>`;
       }).join("");
-      const hitWidth = Math.max(5, plotWidth / Math.max(hours.length - 1, 1));
-      const hits = hours.map((hour, index) => `
-        <rect class="hourly-hit" data-index="${index}" x="${xAt(index) - hitWidth / 2}" y="${top}" width="${hitWidth}" height="${plotHeight}" fill="transparent">
-          <title>${escapeHtml(`${hour.replace("T", " ")} ${Number(values[index]).toLocaleString("zh-CN")} tokens`)}</title>
-        </rect>
-      `).join("");
 
       const canvas = document.getElementById("hourlyChartCanvas");
       const svg = document.getElementById("hourlyChart");
@@ -2033,40 +2102,52 @@ DASHBOARD_HTML = r"""<!doctype html>
           </linearGradient>
         </defs>
         ${grid}
-        <polygon points="${areaPoints}" fill="url(#hourlyArea)"></polygon>
-        <polyline points="${points}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
-        ${values.map((value, index) => value > 0 ? `<circle cx="${xAt(index)}" cy="${yAt(value)}" r="2.5" fill="#ffffff" stroke="${color}" stroke-width="2"></circle>` : "").join("")}
+        <path d="${areaPath}" fill="url(#hourlyArea)"></path>
+        <path class="trend-series trend-series-previous" d="${previousPath}" fill="none" stroke="${previousColor}" stroke-width="2.5" stroke-dasharray="7 6" stroke-linecap="round" stroke-linejoin="round"></path>
+        <path class="trend-series trend-series-current" d="${currentPath}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+        ${context.option.days === 1 ? currentValues.map((value, index) => value > 0 ? `<circle cx="${xAt(index)}" cy="${yAt(value)}" r="2" fill="#ffffff" stroke="${color}" stroke-width="1.5"></circle>` : "").join("") : ""}
         ${labels}
         <g class="hourly-focus" visibility="hidden" pointer-events="none">
           <line x1="0" y1="${top}" x2="0" y2="${top + plotHeight}" stroke="#687184" stroke-width="1" stroke-dasharray="4 4"></line>
-          <circle cx="0" cy="0" r="5" fill="#ffffff" stroke="${color}" stroke-width="3"></circle>
+          <circle class="focus-current" cx="0" cy="0" r="5" fill="#ffffff" stroke="${color}" stroke-width="3"></circle>
+          <circle class="focus-previous" cx="0" cy="0" r="4" fill="#ffffff" stroke="${previousColor}" stroke-width="2.5"></circle>
         </g>
-        ${hits}
+        <rect class="hourly-hit" x="${left}" y="${top}" width="${plotWidth}" height="${plotHeight}" fill="transparent"></rect>
       `;
 
       const tooltip = document.getElementById("hourlyTooltip");
       const focus = svg.querySelector(".hourly-focus");
       const focusLine = focus.querySelector("line");
-      const focusPoint = focus.querySelector("circle");
+      const focusCurrent = focus.querySelector(".focus-current");
+      const focusPrevious = focus.querySelector(".focus-previous");
       const showPoint = index => {
-        const hour = hours[index];
-        const bucket = grouped.get(hour);
+        const currentInterval = currentSlots[index];
+        const previousInterval = previousSlots[index];
+        const currentBucket = grouped.get(currentInterval);
+        const previousBucket = grouped.get(previousInterval);
         const x = xAt(index);
-        const y = yAt(bucket.total);
+        const currentY = yAt(currentBucket.total);
+        const previousY = yAt(previousBucket.total);
         focus.setAttribute("visibility", "visible");
         focusLine.setAttribute("x1", x);
         focusLine.setAttribute("x2", x);
-        focusPoint.setAttribute("cx", x);
-        focusPoint.setAttribute("cy", y);
-        const toolRows = [...bucket.tools.entries()].sort((a, b) => b[1] - a[1]);
+        focusCurrent.setAttribute("cx", x);
+        focusCurrent.setAttribute("cy", currentY);
+        focusPrevious.setAttribute("cx", x);
+        focusPrevious.setAttribute("cy", previousY);
+        const delta = currentBucket.total - previousBucket.total;
+        const deltaText = previousBucket.total
+          ? `${delta >= 0 ? "+" : ""}${trim(delta / previousBucket.total * 100, 1)}%`
+          : currentBucket.total ? "新增" : "0%";
         tooltip.innerHTML = `
-          <span>${escapeHtml(hour.replace("T", " "))} - ${escapeHtml((hour.slice(0, 13) + ":59").replace("T", " "))}</span>
-          <strong>${bucket.total.toLocaleString("zh-CN")} tokens</strong>
-          ${toolRows.map(([name, value]) => `<div class="hourly-tooltip-row"><span>${escapeHtml(name)}</span><span>${Number(value).toLocaleString("zh-CN")}</span></div>`).join("")}
+          <div class="hourly-tooltip-row"><span>${escapeHtml(currentLabel)} · ${escapeHtml(currentInterval.replace("T", " "))}</span><span>${currentBucket.total.toLocaleString("zh-CN")}</span></div>
+          <div class="hourly-tooltip-row"><span>${escapeHtml(previousLabel)} · ${escapeHtml(previousInterval.replace("T", " "))}</span><span>${previousBucket.total.toLocaleString("zh-CN")}</span></div>
+          <strong>较${escapeHtml(previousLabel)} ${escapeHtml(deltaText)}</strong>
         `;
-        const below = y < 105;
+        const focusTop = Math.min(currentY, previousY);
+        const below = focusTop < 105;
         tooltip.style.left = `${Math.max(115, Math.min(width - 115, x))}px`;
-        tooltip.style.top = `${below ? y + 14 : y - 12}px`;
+        tooltip.style.top = `${below ? Math.max(currentY, previousY) + 14 : focusTop - 12}px`;
         tooltip.style.transform = below ? "translate(-50%, 0)" : "translate(-50%, -100%)";
         tooltip.classList.add("show");
       };
@@ -2074,11 +2155,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         focus.setAttribute("visibility", "hidden");
         tooltip.classList.remove("show");
       };
-      svg.querySelectorAll(".hourly-hit").forEach(hit => {
-        const show = () => showPoint(Number(hit.dataset.index || 0));
-        hit.addEventListener("mouseenter", show);
-        hit.addEventListener("click", show);
-      });
+      const showFromEvent = event => {
+        const rect = svg.getBoundingClientRect();
+        const svgX = (event.clientX - rect.left) * width / Math.max(rect.width, 1);
+        const ratio = Math.max(0, Math.min(1, (svgX - left) / Math.max(plotWidth, 1)));
+        showPoint(Math.round(ratio * Math.max(currentSlots.length - 1, 0)));
+      };
+      const hit = svg.querySelector(".hourly-hit");
+      hit.addEventListener("mousemove", showFromEvent);
+      hit.addEventListener("click", showFromEvent);
       svg.addEventListener("mouseleave", hidePoint);
     }
 
@@ -2272,7 +2357,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           dailyByModel: payload.dailyByModel || [],
           dailyByAgentModel: payload.dailyByAgentModel || [],
           dailyByHost: payload.dailyByHost || [],
-          hourlyByTool: payload.hourlyByTool || [],
+          intervalByTool: payload.intervalByTool || [],
           meta: payload.meta || {}
         };
         state.data = data;

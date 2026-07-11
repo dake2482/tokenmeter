@@ -252,9 +252,30 @@ def hourly_summary_db(
     group_by: tuple[str, ...] | None = None,
     timezone_name: str | None = None,
 ) -> list[dict[str, object]]:
+    rows = interval_summary_db(
+        db_path,
+        since=since,
+        group_by=group_by,
+        timezone_name=timezone_name,
+        interval_minutes=60,
+    )
+    for row in rows:
+        row["hour"] = row.pop("interval")
+    return rows
+
+
+def interval_summary_db(
+    db_path: Path | str,
+    since: str | None = None,
+    group_by: tuple[str, ...] | None = None,
+    timezone_name: str | None = None,
+    interval_minutes: int = 15,
+) -> list[dict[str, object]]:
     init_db(db_path)
     dims = _validate_group_by(group_by, ("agent",))
     timezone_value, _ = resolve_timezone(timezone_name)
+    if interval_minutes <= 0 or interval_minutes > 60 or 60 % interval_minutes:
+        raise ValueError("interval_minutes must be a positive divisor of 60")
     since_epoch = parse_since(since)
     where = "where timestamp >= ?" if since_epoch is not None else ""
     params = (since_epoch,) if since_epoch is not None else ()
@@ -269,11 +290,9 @@ def hourly_summary_db(
 
     with _connect(db_path) as conn:
         conn.create_function(
-            "usage_hour",
+            "usage_interval",
             1,
-            lambda value: datetime.fromtimestamp(float(value), timezone_value).strftime(
-                "%Y-%m-%dT%H:00"
-            ),
+            lambda value: _usage_interval(value, timezone_value, interval_minutes),
             deterministic=True,
         )
         conn.create_function("normalize_model", 1, normalize_model_name, deterministic=True)
@@ -281,7 +300,7 @@ def hourly_summary_db(
         rows = conn.execute(
             f"""
             select
-                usage_hour(timestamp) as usage_hour
+                usage_interval(timestamp) as usage_interval
                 {dim_select},
                 count(*) as records,
                 count(distinct session_id) as sessions,
@@ -295,13 +314,13 @@ def hourly_summary_db(
                 coalesce(sum(estimated_cost_usd), 0.0) as estimated_cost_usd
             from usage_records
             {where}
-            group by usage_hour{dim_group}
-            order by usage_hour desc, total_tokens desc
+            group by usage_interval{dim_group}
+            order by usage_interval desc, total_tokens desc
             """,
             params,
         ).fetchall()
 
-    return _merge_hourly_rows(rows, dims)
+    return _merge_interval_rows(rows, dims)
 
 
 def database_metadata_db(db_path: Path | str, timezone_name: str | None = None) -> dict[str, object]:
@@ -503,14 +522,14 @@ def _merge_daily_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[di
     return rows
 
 
-def _merge_hourly_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[dict[str, object]]:
+def _merge_interval_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[dict[str, object]]:
     buckets: dict[tuple[object, ...], dict[str, object]] = {}
     for sql_row in rows:
-        hour = str(sql_row["usage_hour"] or "")
+        interval = str(sql_row["usage_interval"] or "")
         values = tuple(_normalize_group_value(name, sql_row[name]) for name in dims)
-        key = (hour, *values)
+        key = (interval, *values)
         if key not in buckets:
-            row = {"hour": hour, "date": hour[:10]}
+            row = {"interval": interval, "date": interval[:10]}
             row.update({name: value for name, value in zip(dims, key[1:])})
             row.update(
                 {
@@ -537,8 +556,14 @@ def _merge_hourly_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[d
         )
 
     result = list(buckets.values())
-    result.sort(key=lambda row: (str(row["hour"]), int(row["total_tokens"])), reverse=True)
+    result.sort(key=lambda row: (str(row["interval"]), int(row["total_tokens"])), reverse=True)
     return result
+
+
+def _usage_interval(value: object, timezone_value: tzinfo, interval_minutes: int) -> str:
+    moment = datetime.fromtimestamp(float(value), timezone_value)
+    minute = moment.minute // interval_minutes * interval_minutes
+    return moment.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
 
 
 def _normalize_group_value(name: str, value: object) -> str:

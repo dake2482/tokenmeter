@@ -12,7 +12,7 @@ from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
 from tokenmeter.records import UsageRecord
 from tokenmeter.server import _asset_name_for_path, _dashboard_payload, _manifest_payload, _strip_app_prefix
-from tokenmeter.storage import daily_summary_db, hourly_summary_db, upsert_records
+from tokenmeter.storage import daily_summary_db, interval_summary_db, upsert_records
 from tokenmeter.summary import summarize_records
 
 
@@ -118,7 +118,7 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(rows[0]["model"], "GLM-5.2")
         self.assertEqual(rows[0]["total_tokens"], 30)
 
-    def test_hourly_summary_groups_real_records_by_local_hour(self) -> None:
+    def test_interval_summary_groups_real_records_by_quarter_hour(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "tokenmeter.sqlite"
             upsert_records(
@@ -126,21 +126,24 @@ class TokenMeterTests(unittest.TestCase):
                 [
                     _usage_record("a", "GPT-5.5", 10, timestamp=1_000, agent="codex"),
                     _usage_record("b", "GPT-5.5", 20, timestamp=1_800, agent="codex"),
-                    _usage_record("c", "GLM-5.2", 30, timestamp=3_700, agent="hermes"),
+                    _usage_record("c", "GPT-5.5", 30, timestamp=1_850, agent="codex"),
+                    _usage_record("d", "GLM-5.2", 40, timestamp=3_700, agent="hermes"),
                 ],
             )
 
-            rows = hourly_summary_db(
+            rows = interval_summary_db(
                 db_path,
                 since="all",
                 group_by=("agent",),
                 timezone_name="UTC",
+                interval_minutes=15,
             )
 
-        by_hour_agent = {(row["hour"], row["agent"]): row for row in rows}
-        self.assertEqual(by_hour_agent[("1970-01-01T00:00", "codex")]["total_tokens"], 30)
-        self.assertEqual(by_hour_agent[("1970-01-01T01:00", "hermes")]["total_tokens"], 30)
-        self.assertEqual(by_hour_agent[("1970-01-01T01:00", "hermes")]["date"], "1970-01-01")
+        by_interval_agent = {(row["interval"], row["agent"]): row for row in rows}
+        self.assertEqual(by_interval_agent[("1970-01-01T00:15", "codex")]["total_tokens"], 10)
+        self.assertEqual(by_interval_agent[("1970-01-01T00:30", "codex")]["total_tokens"], 50)
+        self.assertEqual(by_interval_agent[("1970-01-01T01:00", "hermes")]["total_tokens"], 40)
+        self.assertEqual(by_interval_agent[("1970-01-01T01:00", "hermes")]["date"], "1970-01-01")
 
     def test_dashboard_payload_combines_home_page_series(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,12 +157,12 @@ class TokenMeterTests(unittest.TestCase):
 
         self.assertEqual(
             set(payload),
-            {"dailyByTool", "dailyByModel", "dailyByAgentModel", "dailyByHost", "hourlyByTool", "meta"},
+            {"dailyByTool", "dailyByModel", "dailyByAgentModel", "dailyByHost", "intervalByTool", "meta"},
         )
         self.assertTrue(payload["dailyByTool"])
         self.assertTrue(payload["dailyByModel"])
         self.assertTrue(payload["dailyByHost"])
-        self.assertIsInstance(payload["hourlyByTool"], list)
+        self.assertIsInstance(payload["intervalByTool"], list)
 
     def test_openclaw_duplicate_seq_events_have_distinct_record_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
