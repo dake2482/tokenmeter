@@ -19,12 +19,14 @@ from urllib.parse import parse_qs, urlparse
 from .collectors import collect_all, parse_since
 from .records import UsageRecord
 from .storage import (
+    dashboard_daily_summary_db,
     daily_summary_db,
     database_metadata_db,
     delete_legacy_codex_records,
     delete_legacy_openclaw_records,
     delete_duplicate_workbuddy_records,
     delete_zero_token_records,
+    five_hour_capacity_db,
     interval_summary_db,
     summarize_db,
     upsert_records,
@@ -46,21 +48,10 @@ DASHBOARD_GROUPS = {
 }
 DASHBOARD_BASE_GROUP = ("host", "agent", "profile", "model")
 DASHBOARD_TREND_SINCE = "61d"
-DASHBOARD_CACHE_TTL_SECONDS = 30.0
+DASHBOARD_CACHE_TTL_SECONDS = 15 * 60.0
 MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 MAX_RECORDS_PER_REQUEST = 5_000
 USAGE_SCHEMA_VERSION = 2
-DASHBOARD_NUMBER_COLUMNS = (
-    "records",
-    "sessions",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "reasoning_tokens",
-    "total_tokens",
-    "estimated_cost_usd",
-)
 _DASHBOARD_CACHE: dict[tuple[str, str, str], tuple[float, dict]] = {}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _SOURCE_TARBALL_CACHE: bytes | None = None
@@ -307,7 +298,12 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         return payload
 
     def _json(self, payload: dict, status: int = 200) -> None:
-        body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         self._send_body(body, "application/json; charset=utf-8", status=status)
 
     def _html(self, html: str) -> None:
@@ -375,7 +371,7 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         )
         if not compressible:
             return body
-        return gzip.compress(body)
+        return gzip.compress(body, compresslevel=5)
 
     def _public_base_url(self) -> str:
         host = self.headers.get("Host") or "127.0.0.1:18888"
@@ -510,7 +506,7 @@ def _dashboard_payload(
     since: str | None = "all",
     timezone_name: str | None = None,
 ) -> dict:
-    base_rows = daily_summary_db(
+    base_rows = dashboard_daily_summary_db(
         db_path,
         since=since,
         group_by=DASHBOARD_BASE_GROUP,
@@ -535,6 +531,7 @@ def _dashboard_payload(
             interval_minutes=15,
         )
     ]
+    payload["fiveHourCapacity"] = five_hour_capacity_db(db_path)
     payload["meta"] = database_metadata_db(db_path, timezone_name=timezone_name)
     return payload
 
@@ -568,13 +565,13 @@ def _rollup_daily_rows(rows: list[dict[str, object]], group_by: tuple[str, ...])
         if key not in buckets:
             row = {"date": source.get("date")}
             row.update({name: value for name, value in zip(group_by, key[1:])})
-            row.update({name: 0.0 if name == "estimated_cost_usd" else 0 for name in DASHBOARD_NUMBER_COLUMNS})
+            row.update({"total_tokens": 0, "estimated_cost_usd": 0.0})
             buckets[key] = row
         bucket = buckets[key]
-        for name in DASHBOARD_NUMBER_COLUMNS:
-            current = float(bucket[name]) if name == "estimated_cost_usd" else int(bucket[name])
-            value = float(source.get(name) or 0) if name == "estimated_cost_usd" else int(source.get(name) or 0)
-            bucket[name] = current + value
+        bucket["total_tokens"] = int(bucket["total_tokens"]) + int(source.get("total_tokens") or 0)
+        bucket["estimated_cost_usd"] = float(bucket["estimated_cost_usd"]) + float(
+            source.get("estimated_cost_usd") or 0
+        )
     result = list(buckets.values())
     result.sort(key=lambda row: (str(row["date"]), int(row["total_tokens"])), reverse=True)
     return result
@@ -864,6 +861,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       --workbuddy: #e3262b;
       --zcode: #bf2ed1;
       --gemini: #1ca34a;
+      --glm: #16946c;
       --cursor: #111827;
       --other: #7c8797;
     }
@@ -973,6 +971,97 @@ DASHBOARD_HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 16px;
       font-weight: 720;
+    }
+    .capacity-section {
+      margin-bottom: 24px;
+    }
+    .capacity-section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+    .capacity-method {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      text-align: right;
+    }
+    .capacity-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .capacity-card {
+      min-width: 0;
+      padding: 20px;
+    }
+    .capacity-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .capacity-agent {
+      font-size: 19px;
+      font-weight: 850;
+    }
+    .capacity-badge {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 3px 7px;
+      color: #687184;
+      background: #f7f7f9;
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .capacity-primary-label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 750;
+    }
+    .capacity-primary-value {
+      margin: 5px 0 14px;
+      font-size: 28px;
+      line-height: 1.05;
+      font-weight: 900;
+      overflow-wrap: anywhere;
+    }
+    .capacity-progress {
+      height: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--track);
+    }
+    .capacity-progress-fill {
+      height: 100%;
+      min-width: 0;
+      border-radius: 999px;
+      background: var(--other);
+    }
+    .capacity-stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .capacity-stat {
+      min-width: 0;
+    }
+    .capacity-stat-value {
+      color: #323a49;
+      font-size: 14px;
+      font-weight: 820;
+      overflow-wrap: anywhere;
+    }
+    .capacity-stat-label {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
     }
     .usage-panel {
       padding: 26px 22px 24px;
@@ -1420,6 +1509,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     @media (max-width: 980px) {
       .page { width: min(100% - 28px, 760px); padding-top: 20px; }
       .metric-grid { grid-template-columns: 1fr; }
+      .capacity-grid { grid-template-columns: 1fr; }
       .today-panel, .usage-panel, .rank-panel, .detail-panel { padding: 22px 18px; border-radius: 14px; }
       .section-title { font-size: 20px; }
       .date, .sync, .metric-label, .chart-dates { font-size: 15px; }
@@ -1454,6 +1544,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       .metric-grid { gap: 10px; margin-bottom: 16px; }
       .metric-card { min-height: 92px; padding: 18px 14px 14px; }
       .metric-value { font-size: 30px; }
+      .capacity-section-head { align-items: flex-start; flex-direction: column; gap: 6px; }
+      .capacity-method { text-align: left; }
+      .capacity-card { padding: 18px 14px; }
+      .capacity-primary-value { font-size: 25px; }
+      .capacity-stats { gap: 8px; }
       .pie-total { font-size: 19px; }
       .section-title { font-size: 19px; }
       .filters {
@@ -1542,6 +1637,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       </article>
     </section>
 
+    <section class="capacity-section" aria-labelledby="capacityTitle">
+      <div class="capacity-section-head">
+        <h2 id="capacityTitle" class="section-title">5 小时 Token 上限估算</h2>
+        <div class="capacity-method">最近 60 天滚动窗口 · 历史估算</div>
+      </div>
+      <div id="capacityGrid" class="capacity-grid"></div>
+    </section>
+
     <section class="panel usage-panel">
       <div class="share-head">
         <h2 id="shareTitle" class="section-title">今日用量占比</h2>
@@ -1622,6 +1725,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       "WorkBuddy": "var(--workbuddy)",
       "ZCode": "var(--zcode)",
       "Gemini": "var(--gemini)",
+      "GLM": "var(--glm)",
       "Other": "var(--other)"
     };
     const MODEL_COLORS = ["#7e5cf1", "#2f64e6", "#f59e0b", "#1397ad", "#e3262b", "#1ca34a", "#7c8797"];
@@ -1629,6 +1733,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     const tokenInput = document.getElementById("tokenInput");
     const authPanel = document.getElementById("authPanel");
     const statusEl = document.getElementById("status");
+    const DASHBOARD_BROWSER_CACHE_KEY = "tokenmeter.dashboard.v1";
+    const DASHBOARD_BROWSER_CACHE_MAX_AGE = 6 * 60 * 60 * 1000;
     let refreshSequence = 0;
     const state = {
       data: null,
@@ -1909,6 +2015,52 @@ DASHBOARD_HTML = r"""<!doctype html>
       if (seconds < 3600) return `最近同步 ${Math.floor(seconds / 60)} 分钟前`;
       if (seconds < 86400) return `最近同步 ${Math.floor(seconds / 3600)} 小时前`;
       return `最近同步 ${Math.floor(seconds / 86400)} 天前`;
+    }
+
+    function releaseTime(timestamp) {
+      if (!timestamp) return "暂无用量";
+      const seconds = Math.max(0, Math.ceil(Number(timestamp) - Date.now() / 1000));
+      if (seconds < 60) return "即将释放";
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.ceil(seconds % 3600 / 60);
+      return hours ? `${hours}时${minutes}分` : `${minutes}分钟`;
+    }
+
+    function renderFiveHourCapacity(data) {
+      const rows = new Map((data.fiveHourCapacity || []).map(row => [String(row.scope || "").toLowerCase(), row]));
+      const cards = [
+        {scope: "codex", label: "Codex", color: "Codex"},
+        {scope: "glm", label: "GLM 总用量", color: "GLM"}
+      ];
+      document.getElementById("capacityGrid").innerHTML = cards.map(card => {
+        const row = rows.get(card.scope) || {};
+        const current = Number(row.currentTokens || 0);
+        const peak = Number(row.observedPeakTokens || 0);
+        const remaining = Math.max(Number(row.remainingToPeakTokens || 0), 0);
+        const progress = peak ? Math.min(current / peak * 100, 100) : 0;
+        const peakTime = row.observedPeakEndAt
+          ? new Date(Number(row.observedPeakEndAt) * 1000).toLocaleString("zh-CN", {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"})
+          : "--";
+        return `
+          <article class="panel capacity-card" title="${escapeHtml(`${card.label} · 最近 ${row.lookbackDays || 60} 天滚动 5 小时峰值估算`)}">
+            <div class="capacity-card-head">
+              <div class="capacity-agent">${escapeHtml(card.label)}</div>
+              <div class="capacity-badge">历史估算</div>
+            </div>
+            <div class="capacity-primary-label">近 5 小时已用</div>
+            <div class="capacity-primary-value">${compactTokens(current, 2)}</div>
+            <div class="capacity-progress" role="progressbar" aria-label="${escapeHtml(`${card.label}距观察峰值进度`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(progress)}">
+              <div class="capacity-progress-fill" style="width:${progress}%;background:${colorFor(card.color)}"></div>
+            </div>
+            <div class="capacity-stats">
+              <div class="capacity-stat"><div class="capacity-stat-value">${compactTokens(peak, 2)}</div><div class="capacity-stat-label">已观察峰值</div></div>
+              <div class="capacity-stat"><div class="capacity-stat-value">${compactTokens(remaining, 2)}</div><div class="capacity-stat-label">距观察峰值</div></div>
+              <div class="capacity-stat"><div class="capacity-stat-value">${escapeHtml(releaseTime(row.nextReleaseAt))}</div><div class="capacity-stat-label">下一批释放</div></div>
+            </div>
+            <div class="capacity-stat-label" style="margin-top:12px">峰值时点 ${escapeHtml(peakTime)}</div>
+          </article>
+        `;
+      }).join("");
     }
 
     function renderShare(context) {
@@ -2272,6 +2424,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderFilters(data);
       const context = buildContext(data);
       renderTop(context);
+      renderFiveHourCapacity(data);
       renderShare(context);
       renderHourlyChart(context);
       renderRanks(context);
@@ -2345,23 +2498,47 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     }
 
+    function normalizeDashboardPayload(payload) {
+      return {
+        dailyByTool: payload.dailyByTool || [],
+        dailyByModel: payload.dailyByModel || [],
+        dailyByAgentModel: payload.dailyByAgentModel || [],
+        dailyByHost: payload.dailyByHost || [],
+        intervalByTool: payload.intervalByTool || [],
+        fiveHourCapacity: payload.fiveHourCapacity || [],
+        meta: payload.meta || {}
+      };
+    }
+
+    function restoreDashboardCache() {
+      try {
+        const cached = JSON.parse(localStorage.getItem(DASHBOARD_BROWSER_CACHE_KEY) || "null");
+        if (!cached?.savedAt || Date.now() - Number(cached.savedAt) > DASHBOARD_BROWSER_CACHE_MAX_AGE) return null;
+        return normalizeDashboardPayload(cached.data || {});
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    function saveDashboardCache(data) {
+      try {
+        localStorage.setItem(DASHBOARD_BROWSER_CACHE_KEY, JSON.stringify({savedAt: Date.now(), data}));
+      } catch (_err) {
+        // A full or disabled localStorage must not block live dashboard data.
+      }
+    }
+
     async function refresh() {
       const sequence = ++refreshSequence;
-      setStatus("加载中...");
+      setStatus(state.data ? "正在更新..." : "加载中...");
       try {
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
         const payload = await api(`/api/v1/dashboard?since=all&timezone=${encodeURIComponent(timezone)}`);
         if (sequence !== refreshSequence) return;
-        const data = {
-          dailyByTool: payload.dailyByTool || [],
-          dailyByModel: payload.dailyByModel || [],
-          dailyByAgentModel: payload.dailyByAgentModel || [],
-          dailyByHost: payload.dailyByHost || [],
-          intervalByTool: payload.intervalByTool || [],
-          meta: payload.meta || {}
-        };
+        const data = normalizeDashboardPayload(payload);
         state.data = data;
         renderDashboard(data);
+        saveDashboardCache(data);
         setStatus("");
       } catch (err) {
         if (sequence !== refreshSequence) return;
@@ -2370,6 +2547,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     wireInteractions();
+    const cachedDashboard = restoreDashboardCache();
+    if (cachedDashboard) {
+      state.data = cachedDashboard;
+      renderDashboard(cachedDashboard);
+    }
     refresh();
     setInterval(refresh, 60 * 1000);
   </script>

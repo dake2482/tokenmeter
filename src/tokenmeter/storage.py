@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import time
 from dataclasses import replace
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,6 +24,8 @@ TOKEN_COLUMNS = (
 )
 SCHEMA_VERSION = 2
 WORKBUDDY_DUPLICATE_WINDOW_SECONDS = 300
+FIVE_HOUR_WINDOW_SECONDS = 5 * 3600
+CAPACITY_LOOKBACK_DAYS = 60
 
 
 def init_db(db_path: Path | str) -> None:
@@ -246,6 +249,64 @@ def daily_summary_db(
     return _merge_daily_rows(rows, dims)
 
 
+def dashboard_daily_summary_db(
+    db_path: Path | str,
+    since: str | None = None,
+    group_by: tuple[str, ...] | None = None,
+    timezone_name: str | None = None,
+) -> list[dict[str, object]]:
+    """Return the lean daily rows used by the dashboard's initial payload."""
+    init_db(db_path)
+    dims = _validate_group_by(group_by, ("agent",))
+    timezone_value, _ = resolve_timezone(timezone_name)
+    since_epoch = parse_since(since)
+    where = "where timestamp >= ?" if since_epoch is not None else ""
+    where_params: tuple[float, ...] = (since_epoch,) if since_epoch is not None else ()
+    dim_select = "".join(f", {name}" for name in dims)
+    dim_group = "".join(f", {name}" for name in dims)
+
+    with _connect(db_path) as conn:
+        bounds = conn.execute(
+            f"select min(timestamp), max(timestamp) from usage_records {where}",
+            where_params,
+        ).fetchone()
+        start_epoch = float(bounds[0]) if bounds and bounds[0] is not None else time.time()
+        end_epoch = float(bounds[1]) if bounds and bounds[1] is not None else start_epoch
+        fixed_offset = _fixed_utc_offset_seconds(timezone_value, start_epoch, end_epoch)
+        conn.row_factory = sqlite3.Row
+        if fixed_offset is not None:
+            date_select = "cast((timestamp + ?) / 86400 as integer) as usage_day"
+            date_group = "usage_day"
+            params: tuple[object, ...] = (fixed_offset, *where_params)
+        else:
+            conn.create_function(
+                "usage_date",
+                1,
+                lambda value: datetime.fromtimestamp(float(value), timezone_value).date().isoformat(),
+                deterministic=True,
+            )
+            date_select = "usage_date(timestamp) as usage_date"
+            date_group = "usage_date"
+            params = where_params
+        rows = conn.execute(
+            f"""
+            select
+                {date_select}
+                {dim_select},
+                sum(input_tokens + output_tokens + cache_read_tokens
+                    + cache_write_tokens + reasoning_tokens) as total_tokens,
+                coalesce(sum(estimated_cost_usd), 0.0) as estimated_cost_usd
+            from usage_records
+            {where}
+            group by {date_group}{dim_group}
+            order by {date_group} desc, total_tokens desc
+            """,
+            params,
+        ).fetchall()
+
+    return _merge_dashboard_daily_rows(rows, dims, fixed_offset is not None)
+
+
 def hourly_summary_db(
     db_path: Path | str,
     since: str | None = None,
@@ -278,7 +339,11 @@ def interval_summary_db(
         raise ValueError("interval_minutes must be a positive divisor of 60")
     since_epoch = parse_since(since)
     where = "where timestamp >= ?" if since_epoch is not None else ""
-    params = (since_epoch,) if since_epoch is not None else ()
+    bucket_seconds = interval_minutes * 60
+    offset = datetime.now(timezone_value).utcoffset()
+    bucket_phase = int(offset.total_seconds() if offset else 0) % bucket_seconds
+    where_params = (since_epoch,) if since_epoch is not None else ()
+    params = (bucket_phase, bucket_seconds, *where_params)
     dim_select = "".join(
         ", normalize_model(model) as model" if name == "model" else f", {name}"
         for name in dims
@@ -289,18 +354,12 @@ def interval_summary_db(
     )
 
     with _connect(db_path) as conn:
-        conn.create_function(
-            "usage_interval",
-            1,
-            lambda value: _usage_interval(value, timezone_value, interval_minutes),
-            deterministic=True,
-        )
         conn.create_function("normalize_model", 1, normalize_model_name, deterministic=True)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
             select
-                usage_interval(timestamp) as usage_interval
+                cast((timestamp + ?) / ? as integer) as usage_bucket
                 {dim_select},
                 count(*) as records,
                 count(distinct session_id) as sessions,
@@ -314,13 +373,67 @@ def interval_summary_db(
                 coalesce(sum(estimated_cost_usd), 0.0) as estimated_cost_usd
             from usage_records
             {where}
-            group by usage_interval{dim_group}
-            order by usage_interval desc, total_tokens desc
+            group by usage_bucket{dim_group}
+            order by usage_bucket desc, total_tokens desc
             """,
             params,
         ).fetchall()
 
-    return _merge_interval_rows(rows, dims)
+    prepared_rows: list[dict[str, object]] = []
+    for row in rows:
+        prepared = dict(row)
+        bucket_epoch = int(prepared["usage_bucket"]) * bucket_seconds - bucket_phase
+        prepared["usage_interval"] = _usage_interval(
+            bucket_epoch,
+            timezone_value,
+            interval_minutes,
+        )
+        prepared_rows.append(prepared)
+    return _merge_interval_rows(prepared_rows, dims)
+
+
+def five_hour_capacity_db(
+    db_path: Path | str,
+    now: float | None = None,
+    lookback_days: int = CAPACITY_LOOKBACK_DAYS,
+) -> list[dict[str, object]]:
+    init_db(db_path)
+    current_time = time.time() if now is None else float(now)
+    if not math.isfinite(current_time) or current_time <= 0:
+        raise ValueError("now must be a positive finite timestamp")
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
+
+    since_epoch = current_time - lookback_days * 86400
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            select
+                agent,
+                model,
+                timestamp,
+                input_tokens + output_tokens + cache_read_tokens
+                    + cache_write_tokens + reasoning_tokens as total_tokens
+            from usage_records
+            where (agent = 'codex' or lower(model) like '%glm%')
+                and timestamp >= ? and timestamp <= ?
+            order by timestamp
+            """,
+            (since_epoch, current_time),
+        ).fetchall()
+
+    by_scope: dict[str, list[tuple[float, int]]] = {"codex": [], "glm": []}
+    for agent, model, timestamp, total_tokens in rows:
+        event = (float(timestamp), int(total_tokens or 0))
+        if str(agent) == "codex":
+            by_scope["codex"].append(event)
+        if normalize_model_name(model).upper().startswith("GLM-"):
+            by_scope["glm"].append(event)
+
+    return [
+        _five_hour_scope_capacity(scope, by_scope[scope], current_time, lookback_days)
+        for scope in ("codex", "glm")
+    ]
 
 
 def database_metadata_db(db_path: Path | str, timezone_name: str | None = None) -> dict[str, object]:
@@ -522,7 +635,40 @@ def _merge_daily_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[di
     return rows
 
 
-def _merge_interval_rows(rows: list[sqlite3.Row], dims: tuple[str, ...]) -> list[dict[str, object]]:
+def _merge_dashboard_daily_rows(
+    rows: list[sqlite3.Row],
+    dims: tuple[str, ...],
+    numeric_date: bool,
+) -> list[dict[str, object]]:
+    epoch = datetime(1970, 1, 1)
+    buckets: dict[tuple[object, ...], dict[str, object]] = {}
+    for sql_row in rows:
+        usage_date = (
+            (epoch + timedelta(days=int(sql_row["usage_day"]))).date().isoformat()
+            if numeric_date
+            else str(sql_row["usage_date"] or "")
+        )
+        values = tuple(_normalize_group_value(name, sql_row[name]) for name in dims)
+        key = (usage_date, *values)
+        if key not in buckets:
+            row = {"date": usage_date}
+            row.update({name: value for name, value in zip(dims, values)})
+            row.update({"total_tokens": 0, "estimated_cost_usd": 0.0})
+            buckets[key] = row
+        bucket = buckets[key]
+        bucket["total_tokens"] = int(bucket["total_tokens"]) + int(sql_row["total_tokens"] or 0)
+        bucket["estimated_cost_usd"] = float(bucket["estimated_cost_usd"]) + float(
+            sql_row["estimated_cost_usd"] or 0
+        )
+    result = list(buckets.values())
+    result.sort(key=lambda row: (str(row["date"]), int(row["total_tokens"])), reverse=True)
+    return result
+
+
+def _merge_interval_rows(
+    rows: list[sqlite3.Row | dict[str, object]],
+    dims: tuple[str, ...],
+) -> list[dict[str, object]]:
     buckets: dict[tuple[object, ...], dict[str, object]] = {}
     for sql_row in rows:
         interval = str(sql_row["usage_interval"] or "")
@@ -564,6 +710,72 @@ def _usage_interval(value: object, timezone_value: tzinfo, interval_minutes: int
     moment = datetime.fromtimestamp(float(value), timezone_value)
     minute = moment.minute // interval_minutes * interval_minutes
     return moment.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+
+
+def _fixed_utc_offset_seconds(
+    timezone_value: tzinfo,
+    start_epoch: float,
+    end_epoch: float,
+) -> int | None:
+    start = min(start_epoch, end_epoch)
+    end = max(start_epoch, end_epoch)
+    expected: int | None = None
+    cursor = start
+    while True:
+        offset = datetime.fromtimestamp(cursor, timezone_value).utcoffset()
+        seconds = int(offset.total_seconds() if offset else 0)
+        if expected is None:
+            expected = seconds
+        elif seconds != expected:
+            return None
+        if cursor >= end:
+            return expected
+        cursor = min(cursor + 6 * 3600, end)
+
+
+def _five_hour_scope_capacity(
+    scope: str,
+    events: list[tuple[float, int]],
+    now: float,
+    lookback_days: int,
+) -> dict[str, object]:
+    cutoff = now - FIVE_HOUR_WINDOW_SECONDS
+    current_events = [(timestamp, tokens) for timestamp, tokens in events if timestamp > cutoff]
+    current_tokens = sum(tokens for _timestamp, tokens in current_events)
+    next_release_at = (
+        min(timestamp for timestamp, _tokens in current_events) + FIVE_HOUR_WINDOW_SECONDS
+        if current_events
+        else None
+    )
+
+    left = 0
+    rolling_tokens = 0
+    observed_peak_tokens = 0
+    observed_peak_start_at: float | None = None
+    observed_peak_end_at: float | None = None
+    for right, (timestamp, tokens) in enumerate(events):
+        rolling_tokens += tokens
+        while left <= right and events[left][0] <= timestamp - FIVE_HOUR_WINDOW_SECONDS:
+            rolling_tokens -= events[left][1]
+            left += 1
+        if rolling_tokens > observed_peak_tokens:
+            observed_peak_tokens = rolling_tokens
+            observed_peak_start_at = events[left][0] if left <= right else timestamp
+            observed_peak_end_at = timestamp
+
+    return {
+        "scope": scope,
+        "windowMinutes": FIVE_HOUR_WINDOW_SECONDS // 60,
+        "currentTokens": current_tokens,
+        "observedPeakTokens": observed_peak_tokens,
+        "remainingToPeakTokens": max(observed_peak_tokens - current_tokens, 0),
+        "windowStartedAt": cutoff,
+        "nextReleaseAt": next_release_at,
+        "observedPeakStartAt": observed_peak_start_at,
+        "observedPeakEndAt": observed_peak_end_at,
+        "lookbackDays": lookback_days,
+        "method": "observed_rolling_peak",
+    }
 
 
 def _normalize_group_value(name: str, value: object) -> str:

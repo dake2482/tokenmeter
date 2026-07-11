@@ -12,7 +12,7 @@ from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
 from tokenmeter.records import UsageRecord
 from tokenmeter.server import _asset_name_for_path, _dashboard_payload, _manifest_payload, _strip_app_prefix
-from tokenmeter.storage import daily_summary_db, interval_summary_db, upsert_records
+from tokenmeter.storage import daily_summary_db, five_hour_capacity_db, interval_summary_db, upsert_records
 from tokenmeter.summary import summarize_records
 
 
@@ -145,6 +145,31 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(by_interval_agent[("1970-01-01T01:00", "hermes")]["total_tokens"], 40)
         self.assertEqual(by_interval_agent[("1970-01-01T01:00", "hermes")]["date"], "1970-01-01")
 
+    def test_five_hour_capacity_reports_current_usage_and_observed_peak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "tokenmeter.sqlite"
+            upsert_records(
+                db_path,
+                [
+                    _usage_record("a", "GPT-5.5", 10, timestamp=1_000, agent="codex"),
+                    _usage_record("b", "GPT-5.5", 20, timestamp=2_000, agent="codex"),
+                    _usage_record("c", "GPT-5.5", 30, timestamp=19_000, agent="codex"),
+                    _usage_record("d", "GLM-5.2", 40, timestamp=19_500, agent="zcode"),
+                    _usage_record("e", "glm5.2", 25, timestamp=19_600, agent="hermes"),
+                    _usage_record("f", "GPT-5.5", 100, timestamp=19_700, agent="zcode"),
+                ],
+            )
+
+            rows = five_hour_capacity_db(db_path, now=20_001, lookback_days=1)
+
+        by_scope = {row["scope"]: row for row in rows}
+        self.assertEqual(by_scope["codex"]["currentTokens"], 30)
+        self.assertEqual(by_scope["codex"]["observedPeakTokens"], 50)
+        self.assertEqual(by_scope["codex"]["remainingToPeakTokens"], 20)
+        self.assertEqual(by_scope["codex"]["nextReleaseAt"], 37_000)
+        self.assertEqual(by_scope["glm"]["currentTokens"], 65)
+        self.assertEqual(by_scope["glm"]["observedPeakTokens"], 65)
+
     def test_dashboard_payload_combines_home_page_series(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -157,10 +182,22 @@ class TokenMeterTests(unittest.TestCase):
 
         self.assertEqual(
             set(payload),
-            {"dailyByTool", "dailyByModel", "dailyByAgentModel", "dailyByHost", "intervalByTool", "meta"},
+            {
+                "dailyByTool",
+                "dailyByModel",
+                "dailyByAgentModel",
+                "dailyByHost",
+                "intervalByTool",
+                "fiveHourCapacity",
+                "meta",
+            },
         )
         self.assertTrue(payload["dailyByTool"])
         self.assertTrue(payload["dailyByModel"])
+        self.assertEqual(
+            set(payload["dailyByTool"][0]),
+            {"date", "agent", "profile", "total_tokens", "estimated_cost_usd"},
+        )
         self.assertTrue(payload["dailyByHost"])
         self.assertIsInstance(payload["intervalByTool"], list)
 
