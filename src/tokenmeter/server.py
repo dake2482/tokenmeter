@@ -990,7 +990,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
     .metric-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 14px;
       margin-bottom: 24px;
     }
@@ -1679,10 +1679,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div id="totalCost" class="metric-value">未配置</div>
         <div class="metric-label">Token 成本</div>
       </article>
-      <article class="panel metric-card">
-        <div id="activeDays" class="metric-value">0</div>
-        <div class="metric-label">活跃天数</div>
-      </article>
     </section>
 
     <section class="capacity-section" aria-labelledby="capacityTitle">
@@ -2040,7 +2036,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     function renderTop(context) {
       const total = sum(context.toolRows);
       const cost = actualCost(context.toolRows);
-      const activeDays = new Set(context.toolRows.filter(row => Number(row.total_tokens || 0) > 0).map(row => row.date)).size;
 
       document.getElementById("periodTitle").textContent = `${context.option.title}数据`;
       document.getElementById("todayDate").textContent = formatDateRange(context);
@@ -2048,7 +2043,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       document.getElementById("todayCost").textContent = cost == null ? "tokens · 成本未配置" : `tokens · ${money(cost)}`;
       document.getElementById("totalTokens").textContent = compactTokens(total, 2);
       document.getElementById("totalCost").textContent = money(cost);
-      document.getElementById("activeDays").textContent = activeDays.toLocaleString("en-US");
       const syncTimestamp = Number(context.meta.lastIngestAt || context.meta.latestTimestamp || 0);
       document.getElementById("syncText").textContent = formatSyncTime(syncTimestamp);
       document.getElementById("modelRankTitle").textContent = `${context.option.title}按模型`;
