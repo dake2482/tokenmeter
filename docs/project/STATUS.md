@@ -4,10 +4,10 @@
 
 - Purpose: Collect and visualize token-usage metadata from supported AI development tools without reading message content or secrets.
 - Health: `GREEN`
-- Milestone: `TOKENMETER-004` — 发布 TokenMeter 到 GitHub 并完善中文 README (`REVIEW`)
+- Milestone: `TOKENMETER-004` — 发布 TokenMeter 到 GitHub 并完善中文 README (`DONE`)
 - Next action: Push the reviewed commit when explicitly authorized, then run the project closeout gate.
-- Updated: `2026-07-12T15:56:30+08:00`
-- Git: branch `main`, dirty files `8`, head `3ab81a154923`
+- Updated: `2026-07-12T16:02:20+08:00`
+- Git: branch `main`, dirty files `2`, head `13be2dfdb97b`
 - Execution metadata: Codex 2/2 active/total; ZCode 0/0 active/total
 
 ## Current work
@@ -15,7 +15,6 @@
 | Requirement | State | Priority | Executor | Task | Branch / worktree | Next action |
 |---|---|---|---|---|---|---|
 | TOKENMETER-003 | REVIEW | P1 | codex | codex-tokenmeter-dashboard-metric-review-20260712 | main / local | Push the reviewed commit when explicitly authorized, then run the project closeout gate. |
-| TOKENMETER-004 | REVIEW | P1 | codex | codex-tokenmeter-github-publish-20260712 | main / local | 提交并推送到已绑定的 GitHub 远端 `dake2482/tokenmeter`。 |
 
 ## Blockers
 
@@ -23,4 +22,4 @@
 
 ## Latest verification evidence
 
-- git diff --check passed.
+- Release preparation commit 13be2df was pushed to origin/main.
