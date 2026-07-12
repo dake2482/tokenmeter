@@ -5,16 +5,16 @@
 - Purpose: Collect and visualize token-usage metadata from supported AI development tools without reading message content or secrets.
 - Health: `GREEN`
 - Milestone: `TOKENMETER-004` — 发布 TokenMeter 到 GitHub 并完善中文 README (`DONE`)
-- Next action: Push the reviewed commit when explicitly authorized, then run the project closeout gate.
+- Next action: TokenMeter 已发布到 GitHub；后续按需求继续部署或迭代。
 - Updated: `2026-07-12T16:02:20+08:00`
-- Git: branch `main`, dirty files `0`, head `30d4433778e0`
+- Git: branch `main`, dirty files `2`, head `4e030fa02717`
 - Execution metadata: Codex 2/2 active/total; ZCode 0/0 active/total
 
 ## Current work
 
 | Requirement | State | Priority | Executor | Task | Branch / worktree | Next action |
 |---|---|---|---|---|---|---|
-| TOKENMETER-003 | REVIEW | P1 | codex | codex-tokenmeter-dashboard-metric-review-20260712 | main / local | Push the reviewed commit when explicitly authorized, then run the project closeout gate. |
+| - | - | - | - | - | - | No active requirement |
 
 ## Blockers
 
@@ -22,4 +22,4 @@
 
 ## Latest verification evidence
 
-- Release preparation commit 13be2df was pushed to origin/main.
+- The same 23 tests and syntax checks passed in the isolated tengxun staging directory before deployment.
