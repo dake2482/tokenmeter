@@ -7,7 +7,7 @@
 - Milestone: `TOKENMETER-004` — 发布 TokenMeter 到 GitHub 并完善中文 README (`DONE`)
 - Next action: TokenMeter 已发布到 GitHub；后续按需求继续部署或迭代。
 - Updated: `2026-07-12T16:02:20+08:00`
-- Git: branch `main`, dirty files `2`, head `4e030fa02717`
+- Git boundary: branch `main`; run `portfolio closeout TOKENMETER` for live delivery state.
 - Execution metadata: Codex 2/2 active/total; ZCode 0/0 active/total
 
 ## Current work
