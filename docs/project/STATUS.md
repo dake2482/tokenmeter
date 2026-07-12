@@ -7,7 +7,7 @@
 - Milestone: `TOKENMETER-004` — 发布 TokenMeter 到 GitHub 并完善中文 README (`DONE`)
 - Next action: Push the reviewed commit when explicitly authorized, then run the project closeout gate.
 - Updated: `2026-07-12T16:02:20+08:00`
-- Git: branch `main`, dirty files `0`, head `7ef967ac5052`
+- Git: branch `main`, dirty files `0`, head `97e827196135`
 - Execution metadata: Codex 2/2 active/total; ZCode 0/0 active/total
 
 ## Current work
