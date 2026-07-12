@@ -6,10 +6,11 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from tokenmeter.__main__ import _parse_duration_seconds
-from tokenmeter.collectors import collect_all, parse_since
+from tokenmeter.collectors import _reconcile_codex_records, collect_all, parse_since
 from tokenmeter.records import UsageRecord
 from tokenmeter.server import (
     PayloadError,
@@ -302,6 +303,83 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(sum(record.total_tokens for record in records), 150)
         self.assertEqual(duplicate_record_ids, ["codex:codex-thread-1:2"])
 
+    def test_codex_excludes_forked_rollout_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            db_path = home / ".codex" / "state_5.sqlite"
+            _make_codex_db(db_path, token_count=100, updated_at=200)
+            child_path = home / ".codex" / "sessions" / "child.jsonl"
+            _add_codex_forked_thread(db_path, child_path)
+            duplicate_record_ids: list[str] = []
+
+            records = collect_all(
+                home=home,
+                host="test-host",
+                since=0,
+                agents=["codex"],
+                duplicate_record_ids=duplicate_record_ids,
+            )
+
+        self.assertEqual([record.session_id for record in records], ["codex-thread-1"])
+        self.assertEqual(duplicate_record_ids, ["codex:codex-child:2"])
+
+    def test_codex_reconciliation_matches_daily_model_targets(self) -> None:
+        timestamp = 2_000_000
+        date = datetime.fromtimestamp(timestamp).astimezone().date().isoformat()
+        records = [
+            UsageRecord(
+                record_id="codex:a:1",
+                host="test-host",
+                agent="codex",
+                profile="Project",
+                source="token_count",
+                session_id="a",
+                provider="openai",
+                model="gpt-5.5",
+                timestamp=timestamp,
+                input_tokens=10,
+                cache_read_tokens=20,
+                output_tokens=6,
+                reasoning_tokens=4,
+            ),
+            UsageRecord(
+                record_id="codex:a:2",
+                host="test-host",
+                agent="codex",
+                profile="Project",
+                source="token_count",
+                session_id="a",
+                provider="openai",
+                model="gpt-5.5",
+                timestamp=timestamp + 1,
+                input_tokens=30,
+                cache_read_tokens=80,
+                output_tokens=15,
+                reasoning_tokens=5,
+            ),
+        ]
+
+        reconciled = _reconcile_codex_records(
+            records,
+            {
+                (date, "GPT-5.5"): {
+                    "input": 20,
+                    "cache_read": 50,
+                    "cache_write": 0,
+                    "output": 30,
+                }
+            },
+            "test-host",
+        )
+
+        self.assertEqual({record.record_id for record in reconciled}, {"codex:a:1", "codex:a:2"})
+        self.assertEqual(sum(record.input_tokens for record in reconciled), 20)
+        self.assertEqual(sum(record.cache_read_tokens for record in reconciled), 50)
+        self.assertEqual(
+            sum(record.output_tokens + record.reasoning_tokens for record in reconciled),
+            30,
+        )
+
     def test_duplicate_record_ids_are_validated_and_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "tokenmeter.sqlite"
@@ -561,6 +639,48 @@ def _make_codex_duplicate_rollout_jsonl(path: Path) -> None:
 
     events = [event(100, 100, 100), event(110, 100, 100), event(120, 150, 50)]
     path.write_text("\n".join(json.dumps(item) for item in events), encoding="utf-8")
+
+
+def _add_codex_forked_thread(db_path: Path, rollout_path: Path) -> None:
+    rollout_path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "type": "session_meta",
+            "timestamp": 201,
+            "payload": {
+                "id": "codex-child",
+                "forked_from_id": "codex-thread-1",
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": 202,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 90,
+                        "cached_input_tokens": 20,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 2,
+                        "total_tokens": 100,
+                    },
+                    "total_token_usage": {"total_tokens": 100},
+                },
+            },
+        },
+    ]
+    rollout_path.write_text("\n".join(json.dumps(item) for item in events), encoding="utf-8")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            insert into threads values (
+                'codex-child', ?, 201, 202, 'subagent', 'subagent', 'openai',
+                '/Users/alice/Project', 100, 'child', 'gpt-test'
+            )
+            """,
+            (str(rollout_path),),
+        )
 
 
 def _make_zcode_db(path: Path) -> None:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import re
 import socket
 import sqlite3
+import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .records import UsageRecord
+from .records import UsageRecord, normalize_model_name
 
 TOKEN_FIELDS = {
     "input_tokens",
@@ -86,6 +90,8 @@ def collect_codex(
     since: float | None = None,
     duplicate_record_ids: list[str] | None = None,
 ) -> list[UsageRecord]:
+    opentoken_bin = _opentoken_binary(home)
+    collection_since = _local_day_start(since) if opentoken_bin is not None else since
     db_path = _newest_existing(
         home / ".codex" / "state_5.sqlite",
         home / ".codex" / "sqlite" / "state_5.sqlite",
@@ -103,8 +109,8 @@ def collect_codex(
         if not required.issubset(cols):
             return []
         selected = sorted(cols & _CODEX_COLUMNS)
-        where = "where updated_at >= ?" if since is not None else ""
-        params = (since,) if since is not None else ()
+        where = "where updated_at >= ?" if collection_since is not None else ""
+        params = (collection_since,) if collection_since is not None else ()
         rows = conn.execute(f"select {', '.join(selected)} from threads {where}", params).fetchall()
     except sqlite3.Error:
         return []
@@ -117,17 +123,31 @@ def collect_codex(
         rollout_path = Path(str(data.get("rollout_path") or ""))
         if not rollout_path.exists():
             continue
-        if since is not None and _mtime_before(rollout_path, since):
+        if collection_since is not None and _mtime_before(rollout_path, collection_since):
+            continue
+        if _codex_forked_from(rollout_path):
+            if duplicate_record_ids is not None:
+                duplicate_record_ids.extend(
+                    _codex_token_record_ids(rollout_path, str(data.get("id") or rollout_path.stem))
+                )
             continue
         records.extend(
             _collect_codex_rollout_jsonl(
                 rollout_path,
                 data,
                 host,
-                since,
+                collection_since,
                 duplicate_record_ids,
             )
         )
+    if opentoken_bin is not None:
+        targets = _opentoken_codex_targets(opentoken_bin, home, collection_since)
+        if targets is not None and (targets or not records):
+            original_record_ids = {record.record_id for record in records}
+            records = _reconcile_codex_records(records, targets, host)
+            if duplicate_record_ids is not None:
+                kept_record_ids = {record.record_id for record in records}
+                duplicate_record_ids.extend(sorted(original_record_ids - kept_record_ids))
     return records
 
 
@@ -480,6 +500,191 @@ def _collect_codex_rollout_jsonl(
                 )
             )
     return records
+
+
+def _codex_forked_from(path: Path) -> str | None:
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError:
+        return None
+    with handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "session_meta":
+                continue
+            payload = _as_dict(event.get("payload"))
+            value = payload.get("forked_from_id")
+            return str(value) if value else None
+    return None
+
+
+def _codex_token_record_ids(path: Path, thread_id: str) -> list[str]:
+    record_ids: list[str] = []
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError:
+        return record_ids
+    with handle:
+        for line_no, line in enumerate(handle, start=1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = _as_dict(event.get("payload"))
+            if payload.get("type") == "token_count":
+                record_ids.append(f"codex:{thread_id}:{line_no}")
+    return record_ids
+
+
+def _opentoken_binary(home: Path) -> Path | None:
+    path = home / ".local" / "bin" / "opentoken"
+    return path if path.is_file() and os.access(path, os.X_OK) else None
+
+
+def _local_day_start(timestamp: float | None) -> float | None:
+    if timestamp is None:
+        return None
+    local = datetime.fromtimestamp(timestamp).astimezone()
+    return local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _opentoken_codex_targets(
+    binary: Path,
+    home: Path,
+    since: float | None,
+) -> dict[tuple[str, str], dict[str, int]] | None:
+    command = [str(binary), "preview"]
+    if since is not None:
+        command.extend(["--since", datetime.fromtimestamp(since).astimezone().date().isoformat()])
+    command.extend(["--tool", "codex", "--json"])
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["CODEX_HOME"] = str(home / ".codex")
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return None
+    targets: dict[tuple[str, str], dict[str, int]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("tool") != "codex":
+            continue
+        date = str(row.get("date") or "")
+        model = normalize_model_name(row.get("model"))
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or not model:
+            continue
+        targets[(date, model)] = {
+            "input": _int(row.get("input")),
+            "cache_read": _int(row.get("cache_read")),
+            "cache_write": _int(row.get("cache_write")),
+            "output": _int(row.get("output")),
+        }
+    return targets
+
+
+def _reconcile_codex_records(
+    records: list[UsageRecord],
+    targets: dict[tuple[str, str], dict[str, int]],
+    host: str,
+) -> list[UsageRecord]:
+    grouped: dict[tuple[str, str], list[UsageRecord]] = {}
+    for record in records:
+        key = (datetime.fromtimestamp(record.timestamp).astimezone().date().isoformat(), record.model)
+        grouped.setdefault(key, []).append(record)
+
+    reconciled: list[UsageRecord] = []
+    for key, target in sorted(targets.items()):
+        bucket = grouped.get(key, [])
+        if not bucket:
+            reconciled.append(_synthetic_codex_record(key, target, host))
+            continue
+        input_values = _scale_integer_values([row.input_tokens for row in bucket], target["input"])
+        cache_read_values = _scale_integer_values(
+            [row.cache_read_tokens for row in bucket], target["cache_read"]
+        )
+        cache_write_values = _scale_integer_values(
+            [row.cache_write_tokens for row in bucket], target["cache_write"]
+        )
+        combined_output = [row.output_tokens + row.reasoning_tokens for row in bucket]
+        output_values = _scale_integer_values(combined_output, target["output"])
+        for index, row in enumerate(bucket):
+            base_output = combined_output[index]
+            scaled_output = output_values[index]
+            reasoning = (
+                min(scaled_output, round(scaled_output * row.reasoning_tokens / base_output))
+                if base_output
+                else 0
+            )
+            reconciled.append(
+                replace(
+                    row,
+                    input_tokens=input_values[index],
+                    cache_read_tokens=cache_read_values[index],
+                    cache_write_tokens=cache_write_values[index],
+                    output_tokens=scaled_output - reasoning,
+                    reasoning_tokens=reasoning,
+                )
+            )
+    return [record for record in reconciled if record.total_tokens > 0]
+
+
+def _scale_integer_values(values: list[int], target: int) -> list[int]:
+    if not values:
+        return []
+    if target <= 0:
+        return [0] * len(values)
+    total = sum(values)
+    if total <= 0:
+        return [target, *([0] * (len(values) - 1))]
+    scaled: list[int] = []
+    remainders: list[tuple[int, int]] = []
+    for index, value in enumerate(values):
+        quotient, remainder = divmod(value * target, total)
+        scaled.append(quotient)
+        remainders.append((remainder, index))
+    for _, index in sorted(remainders, reverse=True)[: target - sum(scaled)]:
+        scaled[index] += 1
+    return scaled
+
+
+def _synthetic_codex_record(
+    key: tuple[str, str],
+    target: dict[str, int],
+    host: str,
+) -> UsageRecord:
+    date, model = key
+    digest = hashlib.sha256(f"{date}\0{model}".encode("utf-8")).hexdigest()[:20]
+    timestamp = datetime.fromisoformat(f"{date}T12:00:00").astimezone().timestamp()
+    return UsageRecord(
+        record_id=f"codex:opentoken:{digest}",
+        host=host,
+        agent="codex",
+        profile="default",
+        source="opentoken-reconciled",
+        session_id=f"opentoken:{date}:{model}",
+        provider="openai",
+        model=model,
+        timestamp=timestamp,
+        started_at=timestamp,
+        ended_at=timestamp,
+        input_tokens=target["input"],
+        output_tokens=target["output"],
+        cache_read_tokens=target["cache_read"],
+        cache_write_tokens=target["cache_write"],
+    )
 
 
 def _collect_openclaw_jsonl(

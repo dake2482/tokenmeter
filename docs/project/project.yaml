@@ -9,10 +9,10 @@ success_metrics:
 current_milestone:
   id: TOKENMETER-002
   title: Verify Codex usage accounting
-  status: REVIEW
-health: YELLOW
-next_action: Deploy the committed Codex deduplication fix, run an all-history upload, and verify the corrected production totals.
-updated_at: "2026-07-12T09:18:00+08:00"
+  status: DONE
+health: GREEN
+next_action: Monitor the next scheduled upload while active Codex work continues.
+updated_at: "2026-07-12T10:56:11+08:00"
 validation_commands:
   - "PYTHONPATH=src python3 -m unittest discover -s tests"
   - "PYTHONPATH=src python3 -m py_compile src/tokenmeter/*.py"
