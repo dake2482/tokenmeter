@@ -27,6 +27,7 @@ def collect_all(
     host: str | None = None,
     since: float | None = None,
     agents: Iterable[str] | None = None,
+    duplicate_record_ids: list[str] | None = None,
 ) -> list[UsageRecord]:
     home_path = Path(home or Path.home()).expanduser()
     host_name = host or socket.gethostname()
@@ -43,7 +44,7 @@ def collect_all(
     if "openclaw" in wanted:
         records.extend(collect_openclaw(home_path, host_name, since))
     if "codex" in wanted:
-        records.extend(collect_codex(home_path, host_name, since))
+        records.extend(collect_codex(home_path, host_name, since, duplicate_record_ids))
     if "zcode" in wanted:
         records.extend(collect_zcode(home_path, host_name, since))
     if "workbuddy" in wanted:
@@ -79,7 +80,12 @@ def collect_openclaw(home: Path, host: str, since: float | None = None) -> list[
     return records
 
 
-def collect_codex(home: Path, host: str, since: float | None = None) -> list[UsageRecord]:
+def collect_codex(
+    home: Path,
+    host: str,
+    since: float | None = None,
+    duplicate_record_ids: list[str] | None = None,
+) -> list[UsageRecord]:
     db_path = _newest_existing(
         home / ".codex" / "state_5.sqlite",
         home / ".codex" / "sqlite" / "state_5.sqlite",
@@ -113,7 +119,15 @@ def collect_codex(home: Path, host: str, since: float | None = None) -> list[Usa
             continue
         if since is not None and _mtime_before(rollout_path, since):
             continue
-        records.extend(_collect_codex_rollout_jsonl(rollout_path, data, host, since))
+        records.extend(
+            _collect_codex_rollout_jsonl(
+                rollout_path,
+                data,
+                host,
+                since,
+                duplicate_record_ids,
+            )
+        )
     return records
 
 
@@ -388,6 +402,7 @@ def _collect_codex_rollout_jsonl(
     thread: dict,
     host: str,
     since: float | None,
+    duplicate_record_ids: list[str] | None = None,
 ) -> list[UsageRecord]:
     records: list[UsageRecord] = []
     try:
@@ -401,6 +416,7 @@ def _collect_codex_rollout_jsonl(
     provider = str(thread.get("model_provider") or "openai")
     model = str(thread.get("model") or thread.get("model_provider") or "codex")
 
+    previous_total_usage: int | None = None
     with handle:
         for line_no, line in enumerate(handle, start=1):
             try:
@@ -415,6 +431,21 @@ def _collect_codex_rollout_jsonl(
             if payload.get("type") != "token_count":
                 continue
             info = _as_dict(payload.get("info"))
+            total_usage = _as_dict(info.get("total_token_usage"))
+            cumulative_value = total_usage.get("total_tokens")
+            cumulative_total = _int(cumulative_value) if cumulative_value is not None else None
+            record_id = f"codex:{thread_id}:{line_no}"
+            duplicate_snapshot = (
+                cumulative_total is not None
+                and previous_total_usage is not None
+                and cumulative_total == previous_total_usage
+            )
+            if cumulative_total is not None:
+                previous_total_usage = cumulative_total
+            if duplicate_snapshot:
+                if duplicate_record_ids is not None:
+                    duplicate_record_ids.append(record_id)
+                continue
             usage = _as_dict(info.get("last_token_usage"))
             if not usage:
                 continue
@@ -431,7 +462,7 @@ def _collect_codex_rollout_jsonl(
 
             records.append(
                 UsageRecord(
-                    record_id=f"codex:{thread_id}:{line_no}",
+                    record_id=record_id,
                     host=host,
                     agent="codex",
                     profile=profile,

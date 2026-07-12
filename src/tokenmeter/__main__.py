@@ -16,6 +16,7 @@ from .storage import (
     delete_legacy_codex_records,
     delete_legacy_openclaw_records,
     delete_duplicate_workbuddy_records,
+    delete_records_by_ids,
     delete_zero_token_records,
     summarize_db,
     upsert_records,
@@ -119,24 +120,49 @@ def _cmd_collect(args: argparse.Namespace) -> int:
 
 
 def _cmd_upload(args: argparse.Namespace) -> int:
-    records = _collect_from_args(args)
+    duplicate_record_ids: list[str] = []
+    records = _collect_from_args(args, duplicate_record_ids)
     url = args.server.rstrip("/") + "/api/v1/usage"
-    batches = [records[index:index + UPLOAD_BATCH_SIZE] for index in range(0, len(records), UPLOAD_BATCH_SIZE)]
-    if not batches:
-        batches = [[]]
+    batch_count = max(
+        1,
+        math.ceil(len(records) / UPLOAD_BATCH_SIZE),
+        math.ceil(len(duplicate_record_ids) / UPLOAD_BATCH_SIZE),
+    )
     changed = 0
-    for batch in batches:
-        response = _upload_records(url, batch, args.token)
+    for index in range(batch_count):
+        start = index * UPLOAD_BATCH_SIZE
+        response = _upload_records(
+            url,
+            records[start:start + UPLOAD_BATCH_SIZE],
+            args.token,
+            duplicate_record_ids[start:start + UPLOAD_BATCH_SIZE],
+        )
         changed += int(response.get("changed") or 0)
-    print(json.dumps({"ok": True, "records": len(records), "changed": changed, "batches": len(batches)}))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "records": len(records),
+                "duplicates": len(duplicate_record_ids),
+                "changed": changed,
+                "batches": batch_count,
+            }
+        )
+    )
     return 0
 
 
-def _upload_records(url: str, records: list, token: str | None) -> dict:
+def _upload_records(
+    url: str,
+    records: list,
+    token: str | None,
+    delete_record_ids: list[str] | None = None,
+) -> dict:
     payload = json.dumps(
         {
             "schema_version": USAGE_SCHEMA_VERSION,
             "records": [record.to_dict() for record in records],
+            "delete_record_ids": delete_record_ids or [],
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -171,9 +197,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
-    records = _collect_from_args(args)
+    duplicate_record_ids: list[str] = []
+    records = _collect_from_args(args, duplicate_record_ids)
     agents = {record.agent for record in records}
     cleaned = delete_zero_token_records(args.db)
+    cleaned += delete_records_by_ids(args.db, duplicate_record_ids, "codex")
     if "codex" in agents:
         cleaned += delete_legacy_codex_records(args.db)
     if "openclaw" in agents:
@@ -195,10 +223,19 @@ def _cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
-def _collect_from_args(args: argparse.Namespace):
+def _collect_from_args(
+    args: argparse.Namespace,
+    duplicate_record_ids: list[str] | None = None,
+):
     since = parse_since(args.since)
     agents = [agent.strip() for agent in args.agents.split(",") if agent.strip()]
-    return collect_all(home=Path(args.home), host=args.host, since=since, agents=agents)
+    return collect_all(
+        home=Path(args.home),
+        host=args.host,
+        since=since,
+        agents=agents,
+        duplicate_record_ids=duplicate_record_ids,
+    )
 
 
 def _parse_bind(value: str) -> tuple[str, int]:

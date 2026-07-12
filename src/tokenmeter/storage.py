@@ -156,6 +156,27 @@ def delete_zero_token_records(db_path: Path | str) -> int:
         return conn.total_changes - before
 
 
+def delete_records_by_ids(
+    db_path: Path | str,
+    record_ids: list[str],
+    agent: str,
+) -> int:
+    if not record_ids:
+        return 0
+    init_db(db_path)
+    unique_ids = list(dict.fromkeys(record_ids))
+    with _connect(db_path) as conn:
+        before = conn.total_changes
+        for start in range(0, len(unique_ids), 900):
+            batch = unique_ids[start:start + 900]
+            placeholders = ",".join("?" for _ in batch)
+            conn.execute(
+                f"delete from usage_records where agent = ? and record_id in ({placeholders})",
+                (agent, *batch),
+            )
+        return conn.total_changes - before
+
+
 def delete_duplicate_workbuddy_records(db_path: Path | str) -> int:
     init_db(db_path)
     with _connect(db_path) as conn:

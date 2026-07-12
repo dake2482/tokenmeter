@@ -11,8 +11,22 @@ from pathlib import Path
 from tokenmeter.__main__ import _parse_duration_seconds
 from tokenmeter.collectors import collect_all, parse_since
 from tokenmeter.records import UsageRecord
-from tokenmeter.server import _asset_name_for_path, _dashboard_payload, _manifest_payload, _strip_app_prefix
-from tokenmeter.storage import daily_summary_db, five_hour_capacity_db, interval_summary_db, upsert_records
+from tokenmeter.server import (
+    PayloadError,
+    _asset_name_for_path,
+    _dashboard_payload,
+    _delete_record_ids_from_payload,
+    _ingest_usage_records,
+    _manifest_payload,
+    _strip_app_prefix,
+)
+from tokenmeter.storage import (
+    daily_summary_db,
+    delete_records_by_ids,
+    five_hour_capacity_db,
+    interval_summary_db,
+    upsert_records,
+)
 from tokenmeter.summary import summarize_records
 
 
@@ -266,6 +280,70 @@ class TokenMeterTests(unittest.TestCase):
         self.assertEqual(records[0].total_tokens, 3000)
         self.assertEqual(records[0].timestamp, 2000)
 
+    def test_codex_skips_repeated_cumulative_usage_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            db_path = home / ".codex" / "state_5.sqlite"
+            _make_codex_db(db_path, token_count=100, updated_at=200)
+            with sqlite3.connect(db_path) as conn:
+                rollout_path = Path(conn.execute("select rollout_path from threads").fetchone()[0])
+            _make_codex_duplicate_rollout_jsonl(rollout_path)
+            duplicate_record_ids: list[str] = []
+
+            records = collect_all(
+                home=home,
+                host="test-host",
+                since=0,
+                agents=["codex"],
+                duplicate_record_ids=duplicate_record_ids,
+            )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(sum(record.total_tokens for record in records), 150)
+        self.assertEqual(duplicate_record_ids, ["codex:codex-thread-1:2"])
+
+    def test_duplicate_record_ids_are_validated_and_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "tokenmeter.sqlite"
+            records = [
+                _usage_record("codex:thread:1", "GPT-5.5", 10, agent="codex"),
+                _usage_record("codex:thread:2", "GPT-5.5", 20, agent="codex"),
+            ]
+            upsert_records(db_path, records)
+
+            ids = _delete_record_ids_from_payload(
+                {"delete_record_ids": ["codex:thread:2", "codex:thread:2"]}
+            )
+            deleted = delete_records_by_ids(db_path, ids, "codex")
+            rows = daily_summary_db(db_path, since="all", group_by=("agent",))
+
+        self.assertEqual(ids, ["codex:thread:2"])
+        self.assertEqual(deleted, 1)
+        self.assertEqual(rows[0]["total_tokens"], 10)
+        with self.assertRaises(PayloadError):
+            _delete_record_ids_from_payload({"delete_record_ids": ["openclaw:thread:2"]})
+
+    def test_ingest_reports_codex_and_workbuddy_cleanup_together(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "tokenmeter.sqlite"
+            upsert_records(
+                db_path,
+                [
+                    _usage_record("codex:thread:1", "GPT-5.5", 10, agent="codex"),
+                    _usage_record("workbuddy:trace:1", "GPT-5.5", 20, agent="workbuddy"),
+                ],
+            )
+            changed, cleaned = _ingest_usage_records(
+                db_path,
+                [_usage_record("workbuddy:project:1", "GPT-5.5", 20, agent="workbuddy")],
+                ["codex:thread:1"],
+            )
+            rows = daily_summary_db(db_path, since="all", group_by=("agent",))
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(cleaned, 2)
+        self.assertEqual([(row["agent"], row["total_tokens"]) for row in rows], [("workbuddy", 20)])
+
     def test_web_app_icon_paths_support_tokenmeter_prefix(self) -> None:
         self.assertEqual(_strip_app_prefix("/tokenmeter"), "/")
         self.assertEqual(_strip_app_prefix("/tokenmeter/assets/tokenmeter-plain-t-icon.svg"), "/assets/tokenmeter-plain-t-icon.svg")
@@ -453,11 +531,36 @@ def _make_codex_rollout_jsonl(path: Path, token_count: int, timestamp: int) -> N
                     "output_tokens": output_tokens,
                     "reasoning_output_tokens": reasoning_tokens,
                     "total_tokens": token_count,
-                }
+                },
+                "total_token_usage": {"total_tokens": token_count},
             },
         },
     }
     path.write_text(json.dumps(event), encoding="utf-8")
+
+
+def _make_codex_duplicate_rollout_jsonl(path: Path) -> None:
+    def event(timestamp: int, cumulative: int, total: int) -> dict:
+        return {
+            "type": "event_msg",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": total - 10,
+                        "cached_input_tokens": min(20, total - 10),
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 2,
+                        "total_tokens": total,
+                    },
+                    "total_token_usage": {"total_tokens": cumulative},
+                },
+            },
+        }
+
+    events = [event(100, 100, 100), event(110, 100, 100), event(120, 150, 50)]
+    path.write_text("\n".join(json.dumps(item) for item in events), encoding="utf-8")
 
 
 def _make_zcode_db(path: Path) -> None:

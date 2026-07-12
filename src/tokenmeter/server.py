@@ -25,6 +25,7 @@ from .storage import (
     delete_legacy_codex_records,
     delete_legacy_openclaw_records,
     delete_duplicate_workbuddy_records,
+    delete_records_by_ids,
     delete_zero_token_records,
     five_hour_capacity_db,
     interval_summary_db,
@@ -51,6 +52,7 @@ DASHBOARD_TREND_SINCE = "61d"
 DASHBOARD_CACHE_TTL_SECONDS = 15 * 60.0
 MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 MAX_RECORDS_PER_REQUEST = 5_000
+MAX_DELETE_RECORD_IDS_PER_REQUEST = 5_000
 USAGE_SCHEMA_VERSION = 2
 _DASHBOARD_CACHE: dict[tuple[str, str, str], tuple[float, dict]] = {}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
@@ -122,8 +124,16 @@ def _auto_import_loop(
         started = time.time()
         try:
             since = parse_since(since_text)
-            records = collect_all(home=home, host=host, since=since, agents=agents)
+            duplicate_record_ids: list[str] = []
+            records = collect_all(
+                home=home,
+                host=host,
+                since=since,
+                agents=agents,
+                duplicate_record_ids=duplicate_record_ids,
+            )
             cleaned = delete_zero_token_records(db_path)
+            cleaned += delete_records_by_ids(db_path, duplicate_record_ids, "codex")
             agent_names = {record.agent for record in records}
             if "codex" in agent_names:
                 cleaned += delete_legacy_codex_records(db_path)
@@ -246,13 +256,15 @@ class TokenMeterHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             records = _records_from_payload(payload)
+            delete_record_ids = _delete_record_ids_from_payload(payload)
         except PayloadError as exc:
             self._json({"error": exc.message}, status=exc.status)
             return
-        changed = upsert_records(self.database_path, records)
-        cleaned = 0
-        if any(record.agent == "workbuddy" for record in records):
-            cleaned = delete_duplicate_workbuddy_records(self.database_path)
+        changed, cleaned = _ingest_usage_records(
+            self.database_path,
+            records,
+            delete_record_ids,
+        )
         if changed or cleaned:
             _clear_dashboard_cache()
         self._json(
@@ -417,6 +429,34 @@ def _records_from_payload(payload: dict) -> list[UsageRecord]:
             raise PayloadError(400, f"invalid usage record: {exc}") from exc
         records.append(record)
     return records
+
+
+def _delete_record_ids_from_payload(payload: dict) -> list[str]:
+    items = payload.get("delete_record_ids", [])
+    if not isinstance(items, list):
+        raise PayloadError(400, "delete_record_ids must be a JSON array")
+    if len(items) > MAX_DELETE_RECORD_IDS_PER_REQUEST:
+        raise PayloadError(413, "too many delete_record_ids")
+    result: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item.startswith("codex:"):
+            raise PayloadError(400, "delete_record_ids may only contain Codex record IDs")
+        if len(item) > 512 or any(ord(char) < 32 or ord(char) == 127 for char in item):
+            raise PayloadError(400, "invalid delete_record_id")
+        result.append(item)
+    return list(dict.fromkeys(result))
+
+
+def _ingest_usage_records(
+    database_path: Path,
+    records: list[UsageRecord],
+    delete_record_ids: list[str],
+) -> tuple[int, int]:
+    cleaned = delete_records_by_ids(database_path, delete_record_ids, "codex")
+    changed = upsert_records(database_path, records)
+    if any(record.agent == "workbuddy" for record in records):
+        cleaned += delete_duplicate_workbuddy_records(database_path)
+    return changed, cleaned
 
 
 def _validated_public_base_url(proto: str, host_header: str) -> str:
@@ -1576,6 +1616,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       .chart { padding-right: 0; }
       .axis { padding-right: 8px; font-size: 14px; }
       .chart-dates { font-size: 15px; }
+      .hourly-chart-scroll {
+        overflow-x: hidden;
+        cursor: default;
+      }
+      .hourly-chart-canvas,
+      .hourly-chart {
+        width: 100%;
+      }
       .bars { gap: 2px; min-height: 240px; }
       .bar { min-width: 9px; }
       .rank-row { grid-template-columns: 1fr; }
@@ -2180,6 +2228,28 @@ DASHBOARD_HTML = r"""<!doctype html>
       return path;
     }
 
+    function overviewPoints(values, xAt, yAt, maxPoints) {
+      if (values.length <= maxPoints) {
+        return values.map((value, index) => ({x: xAt(index), y: yAt(value)}));
+      }
+      const bucketSize = Math.ceil(values.length / maxPoints);
+      const points = [];
+      for (let start = 0; start < values.length; start += bucketSize) {
+        const end = Math.min(values.length, start + bucketSize);
+        let peakIndex = start;
+        for (let index = start + 1; index < end; index += 1) {
+          if (values[index] > values[peakIndex]) peakIndex = index;
+        }
+        points.push({x: xAt(peakIndex), y: yAt(values[peakIndex])});
+      }
+      const first = {x: xAt(0), y: yAt(values[0])};
+      const lastIndex = values.length - 1;
+      const last = {x: xAt(lastIndex), y: yAt(values[lastIndex])};
+      if (points[0]?.x !== first.x) points.unshift(first);
+      if (points[points.length - 1]?.x !== last.x) points.push(last);
+      return points;
+    }
+
     function renderHourlyChart(context) {
       const currentSlots = trendSlots(context.days);
       const previousSlots = trendSlots(context.comparisonDays);
@@ -2202,25 +2272,33 @@ DASHBOARD_HTML = r"""<!doctype html>
       const currentValues = currentSlots.map(interval => grouped.get(interval)?.total || 0);
       const previousValues = previousSlots.map(interval => grouped.get(interval)?.total || 0);
       const axisMax = niceAxisMax(Math.max(...currentValues, ...previousValues, 0));
+      const chartViewport = document.getElementById("hourlyChartScroll");
+      const tooltip = document.getElementById("hourlyTooltip");
+      tooltip.classList.remove("show");
+      const isMobileChart = window.matchMedia("(max-width: 560px)").matches;
       const pointSpacing = context.option.days === 1 ? 7 : context.option.days <= 3 ? 3.5 : context.option.days <= 7 ? 2.4 : 1.2;
-      const width = Math.max(660, Math.round(76 + Math.max(currentSlots.length - 1, 0) * pointSpacing));
+      const naturalWidth = Math.max(660, Math.round(76 + Math.max(currentSlots.length - 1, 0) * pointSpacing));
+      const width = isMobileChart ? Math.max(280, chartViewport.clientWidth) : naturalWidth;
       const height = 300;
-      const left = 58;
-      const right = 18;
+      const left = isMobileChart ? 50 : 58;
+      const right = isMobileChart ? 8 : 18;
       const top = 22;
       const bottom = 50;
       const plotWidth = width - left - right;
       const plotHeight = height - top - bottom;
       const xAt = index => left + (currentSlots.length <= 1 ? 0 : index / (currentSlots.length - 1) * plotWidth);
       const yAt = value => top + (1 - Number(value || 0) / axisMax) * plotHeight;
-      const currentPoints = currentValues.map((value, index) => ({x: xAt(index), y: yAt(value)}));
-      const previousPoints = previousValues.map((value, index) => ({x: xAt(index), y: yAt(value)}));
+      const maxOverviewPoints = isMobileChart ? 160 : Number.POSITIVE_INFINITY;
+      const currentPoints = overviewPoints(currentValues, xAt, yAt, maxOverviewPoints);
+      const previousPoints = overviewPoints(previousValues, xAt, yAt, maxOverviewPoints);
       const currentPath = smoothPath(currentPoints);
       const previousPath = smoothPath(previousPoints);
       const areaPath = `${currentPath} L ${left + plotWidth},${top + plotHeight} L ${left},${top + plotHeight} Z`;
       const color = state.selectedAgent === "all" ? "#2f64e6" : colorFor(state.selectedAgent);
       const previousColor = "#9aa3b2";
-      const labelStep = context.option.days === 1 ? 16 : context.option.days <= 3 ? 48 : context.option.days <= 7 ? 96 : 288;
+      const labelStep = isMobileChart
+        ? Math.max(1, Math.ceil(currentSlots.length / 4))
+        : context.option.days === 1 ? 16 : context.option.days <= 3 ? 48 : context.option.days <= 7 ? 96 : 288;
       const labelIndexes = new Set([0, currentSlots.length - 1]);
       for (let index = 0; index < currentSlots.length; index += labelStep) labelIndexes.add(index);
 
@@ -2257,7 +2335,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <path d="${areaPath}" fill="url(#hourlyArea)"></path>
         <path class="trend-series trend-series-previous" d="${previousPath}" fill="none" stroke="${previousColor}" stroke-width="2.5" stroke-dasharray="7 6" stroke-linecap="round" stroke-linejoin="round"></path>
         <path class="trend-series trend-series-current" d="${currentPath}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
-        ${context.option.days === 1 ? currentValues.map((value, index) => value > 0 ? `<circle cx="${xAt(index)}" cy="${yAt(value)}" r="2" fill="#ffffff" stroke="${color}" stroke-width="1.5"></circle>` : "").join("") : ""}
+        ${!isMobileChart && context.option.days === 1 ? currentValues.map((value, index) => value > 0 ? `<circle cx="${xAt(index)}" cy="${yAt(value)}" r="2" fill="#ffffff" stroke="${color}" stroke-width="1.5"></circle>` : "").join("") : ""}
         ${labels}
         <g class="hourly-focus" visibility="hidden" pointer-events="none">
           <line x1="0" y1="${top}" x2="0" y2="${top + plotHeight}" stroke="#687184" stroke-width="1" stroke-dasharray="4 4"></line>
@@ -2267,7 +2345,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         <rect class="hourly-hit" x="${left}" y="${top}" width="${plotWidth}" height="${plotHeight}" fill="transparent"></rect>
       `;
 
-      const tooltip = document.getElementById("hourlyTooltip");
       const focus = svg.querySelector(".hourly-focus");
       const focusLine = focus.querySelector("line");
       const focusCurrent = focus.querySelector(".focus-current");
@@ -2314,7 +2391,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         showPoint(Math.round(ratio * Math.max(currentSlots.length - 1, 0)));
       };
       const hit = svg.querySelector(".hourly-hit");
-      hit.addEventListener("mousemove", showFromEvent);
+      if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+        hit.addEventListener("mousemove", showFromEvent);
+      }
       hit.addEventListener("click", showFromEvent);
       svg.addEventListener("mouseleave", hidePoint);
     }
@@ -2480,6 +2559,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       let dragStart = null;
       hourlyViewport.addEventListener("pointerdown", event => {
         if (event.button !== 0) return;
+        if (!window.matchMedia("(hover: hover) and (pointer: fine)").matches) return;
+        if (hourlyViewport.scrollWidth <= hourlyViewport.clientWidth + 1) return;
         dragStart = {x: event.clientX, scrollLeft: hourlyViewport.scrollLeft};
         hourlyViewport.classList.add("dragging");
         hourlyViewport.setPointerCapture(event.pointerId);

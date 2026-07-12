@@ -131,6 +131,8 @@ PYTHONPATH=src python3 -m tokenmeter summary \
 
 Codex 不按线程级 `tokens_used` 汇总，因为该字段是线程累计值，跨天继续使用会把历史量算到当天。TokenMeter 读取 rollout JSONL 中每次 `token_count` 事件的增量 usage，并按事件时间归档。
 
+Codex 可能连续写入累计值未变化的 `token_count` 快照。TokenMeter 使用 `total_token_usage.total_tokens` 识别并跳过这些重复快照；上传器同时把重复记录 ID 发给中心服务，以精确清理旧版本已经入库的重复数据。
+
 OpenClaw 只统计 `model.completed` 事件，并跳过重复的 `trace.artifacts` usage 快照。
 
 ## Web 看板
