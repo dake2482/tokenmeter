@@ -1,45 +1,59 @@
-# Repository Guidelines
+# TokenMeter Repository Guidelines
 
 ## Shared Policy
 
-Also follow `/Users/dake/Documents/AGENT_POLICY.md`. This file adds Server-specific repository guidance and local service health-check rules.
+Also follow `/Users/dake/Documents/AGENT_POLICY.md`. This file is the TokenMeter-specific contract and adds only repository routing, validation, and the historical local-host audit compatibility workflow.
+
+## Repository Purpose
+
+TokenMeter is a self-hosted Python application that collects token-usage metadata from Hermes, OpenClaw, Codex, ZCode, WorkBuddy, and Claude Code. It stores normalized usage in SQLite, supports uploads from multiple machines, and exposes a Web dashboard. It must not collect message bodies, prompts, responses, credentials, or auth material.
 
 ## Project Structure & Module Organization
 
-This repository is currently a fresh Git project with no application files committed yet. Keep future code organized by purpose:
+- `src/tokenmeter/` contains collectors, normalized records, SQLite storage, summaries, the HTTP server/dashboard, and the CLI entry point.
+- `tests/test_tokenmeter.py` contains the deterministic standard-library unit and integration tests.
+- `scripts/install.sh` installs either the central server or a periodic uploader.
+- `assets/` contains dashboard icons and other static assets.
+- `docs/` contains user and operational documentation; `docs/project/` contains the project-control contract.
 
-- `src/` for production source code.
-- `tests/` for automated tests that mirror `src/` paths where practical.
-- `assets/` for static files such as images, fixtures, or sample data.
-- `docs/` for design notes, runbooks, and user-facing documentation.
-- `scripts/` for repeatable local or CI helper commands.
+Keep runtime databases, logs, generated usage data, credentials, machine-local environment files, and build/cache output out of Git.
 
-Avoid placing generated build output, dependency folders, credentials, or local editor state in the repository.
+## Canonical Validation Commands
 
-## Build, Test, and Development Commands
+Run these from the repository root:
 
-No build or test toolchain is configured yet. When one is added, document the canonical commands here and keep them runnable from the repository root. Examples:
+- `PYTHONPATH=src python3 -m unittest discover -s tests`
+- `PYTHONPATH=src python3 -m py_compile src/tokenmeter/*.py`
+- `sh -n scripts/install.sh`
 
-- `npm install` or equivalent: install project dependencies.
-- `npm run dev`: start the local development server.
-- `npm test`: run the full automated test suite.
-- `npm run build`: create a production build.
-
-Prefer adding these commands to a standard project manifest, such as `package.json`, `Makefile`, or language-specific build config.
+Run all three before handing off a source or installer change. Tests must not require external services unless the requirement explicitly documents that dependency.
 
 ## Coding Style & Naming Conventions
 
-Use consistent formatting within each language ecosystem. Prefer automated formatters and linters over manual style rules, and commit their configuration with the code. Use descriptive names: `kebab-case` for scripts and static assets, `camelCase` for JavaScript/TypeScript variables, and `PascalCase` for component or class names where applicable.
+Follow the existing standard-library Python style, use descriptive `snake_case` names, preserve type annotations, and keep collectors isolated by source. Normalize external records before storage and avoid reading message content. Use `kebab-case` for shell scripts and static assets.
 
 ## Testing Guidelines
 
-Add tests with each behavioral change. Name tests after the unit or workflow they verify, such as `tests/server_config.test.ts` or `tests/test_server_config.py`. Keep fixtures small and deterministic. The default test command should run without external services unless documented otherwise.
+Add or update deterministic tests for every behavioral change. Use temporary files and databases, cover malformed or missing source data, and ensure data-source changes cannot ingest prompts, responses, secrets, or other message content.
+
+## Project Control Files
+
+- `docs/project/project.yaml` records the current milestone, health, next action, and validation commands.
+- `docs/project/requirements/*.md` is the source of truth for requirement status, task ownership, branch/worktree, acceptance criteria, handoff, and evidence.
+- `docs/project/DECISIONS.md` is append-only and records durable implementation or governance decisions.
+- TokenMeter requirement IDs use the `TOKENMETER-NNN` prefix. Cross-project status rules and closeout gates come from the shared policy.
 
 ## Commit & Pull Request Guidelines
 
-There is no existing commit history, so use clear imperative commit messages such as `Add server config loader`. Pull requests should include a short summary, validation steps, linked issues when relevant, and screenshots or logs for user-visible behavior.
+Use clear imperative commit messages. Pull requests should include a short summary, validation commands and results, linked requirement or issue, and screenshots for dashboard changes. Preserve unrelated user changes and stage only the intended files.
 
-## Local Service Health Checks
+## Security & Configuration Tips
+
+Never commit secrets, API keys, bearer tokens, certificates, databases, logs, usage exports, or machine-specific `.env` files. Commit safe examples instead and document required variable names without real values.
+
+## Compatibility: Local Host Service Health Audit
+
+This historical Server-repository workflow is separate from TokenMeter product validation. Keep it available for local host operations.
 
 When the user says `检查服务器状态`, run the checks in this section and return a complete analysis report. Include an overall health summary, per-service status, profile/model inventory, detected issues, supporting command evidence, and recommended next actions. Before changing local service behavior, verify live state with read-only checks. For Hermes, inspect all profiles:
 
@@ -61,7 +75,3 @@ For Futu OpenD, confirm the app and local API port:
 
 - `launchctl list | rg -i 'futu|opend'`
 - `lsof -nP -iTCP:11111 -sTCP:LISTEN`
-
-## Security & Configuration Tips
-
-Never commit secrets, API keys, certificates, or machine-specific `.env` files. Commit safe examples instead, such as `.env.example`, and document required variables in `docs/` or this file.

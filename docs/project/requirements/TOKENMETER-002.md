@@ -22,12 +22,12 @@ evidence:
 - Full-history reconciliation produced exactly 44,486 local-Mac records and 6,744,306,410 tokens in both source rollout data and the production database at the same cutoff.
 - The production database retained 63 independent tengxun-host Codex records, and both the public dashboard and dashboard API returned HTTP 200.
 - A static 2026-07-12 snapshot produced 262,170,591 Codex tokens in opentoken but 3,146,328,583 under TokenMeter's current rule, a 12.00x overstatement.
-- The remaining defect is cross-thread fork/subagent history replay: child rollouts inherit parent token_count history, while the current collector only deduplicates inside each file.
+- "The remaining defect is cross-thread fork/subagent history replay: child rollouts inherit parent token_count history, while the current collector only deduplicates inside each file."
 - Forked rollout records are now removed, while root-thread events are reconciled to the local opentoken day/model totals without losing their Profile or interval timestamps.
 - A frozen 1.1 GB Codex snapshot matched opentoken exactly across all 10 date/model buckets and every input, cache-read, cache-write, and output field.
 - All 23 tests and canonical syntax checks passed locally and on tengxun before deployment.
 - Production reconciliation uploaded 21,788 corrected records and removed 30,257 old fork or duplicate record IDs after a fresh SQLite backup.
-- Stable production dates matched opentoken exactly: 497,750,877 tokens on 2026-07-10 and 658,529,366 on 2026-07-11.
+- "Stable production dates matched opentoken exactly: 497,750,877 tokens on 2026-07-10 and 658,529,366 on 2026-07-11."
 - The real 15-minute LaunchAgent completed with exit code 0, and the public dashboard API returned HTTP 200.
 ---
 

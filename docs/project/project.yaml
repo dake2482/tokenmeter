@@ -7,12 +7,12 @@ success_metrics:
   - The central dashboard reports usage by tool, model, host, profile, and date.
   - Canonical tests and syntax checks pass from the repository root.
 current_milestone:
-  id: TOKENMETER-002
-  title: Verify Codex usage accounting
-  status: DONE
+  id: TOKENMETER-004
+  title: 发布 TokenMeter 到 GitHub 并完善中文 README
+  status: REVIEW
 health: GREEN
-next_action: Monitor the next scheduled upload while active Codex work continues.
-updated_at: "2026-07-12T10:56:11+08:00"
+next_action: 提交并推送到已绑定的 GitHub 远端 `dake2482/tokenmeter`。
+updated_at: "2026-07-12T15:56:30+08:00"
 validation_commands:
   - "PYTHONPATH=src python3 -m unittest discover -s tests"
   - "PYTHONPATH=src python3 -m py_compile src/tokenmeter/*.py"

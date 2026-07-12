@@ -1,14 +1,23 @@
 # TokenMeter
 
-TokenMeter 是一个自部署的 Agent token 用量统计工具。它把多台机器上的 Hermes、OpenClaw、Codex、ZCode、WorkBuddy、Claude Code 用量采集到一个中心 SQLite 数据库，并提供一个 Web 看板查看按工具、模型、服务器、Profile 和历史日期的统计。
+TokenMeter 是一个自部署的 Agent token 用量统计工具。它把多台机器上的 Hermes、OpenClaw、Codex、ZCode、WorkBuddy、Claude Code 用量采集到一个中心 SQLite 数据库，并提供 Web 看板查看按工具、模型、服务器、Profile 和日期维度汇总后的统计。
+
+核心原则：TokenMeter 只采集 token usage、模型、时间、工作目录、session 等统计元数据，不读取消息正文、prompt、回复正文、密钥、Cookie 或认证头。
 
 它适合这样使用：
 
 - 一台机器作为中心服务，运行 Web 看板和接收 API。
 - 其他机器安装轻量上传器，每 15 分钟采集本机 token 用量并上传。
-- 所有安装都可以通过一条命令完成，适合直接贴给 AI Agent 执行。
+- 所有安装都可以通过一条命令完成，适合直接贴给 AI Agent 或服务器终端执行。
 
-TokenMeter 只读取 token usage、模型、时间、cwd、session 等统计元数据，不读取消息正文、prompt、回复正文或密钥。
+## 核心能力
+
+- 多 Agent 采集：支持 Hermes、OpenClaw、Codex、ZCode、WorkBuddy 和 Claude Code。
+- 多机器上传：一台中心服务接收多台机器的周期性上报。
+- 本地 SQLite：中心端使用 SQLite 保存规范化后的 usage 记录。
+- Web 看板：按 Agent、模型、服务器、Profile、日期查看 token 和成本估算。
+- 安全边界清晰：不采集对话内容、提示词、回复正文、凭据或认证材料。
+- 零外部依赖运行：核心 CLI、采集器、HTTP 服务和测试均使用 Python 标准库。
 
 ## AI 一键安装
 
@@ -142,7 +151,7 @@ OpenClaw 只统计 `model.completed` 事件，并跳过重复的 `trace.artifact
 看板包含：
 
 - 顶部筛选：按 Agent 和时间范围筛选。
-- 今日/昨日/区间数据：展示当前筛选范围的总 token 和估算成本。
+- 今日/昨日/区间数据：展示当前筛选范围的总 token、近 5 小时估算和估算成本。
 - 用量占比：真实 SVG 饼图，悬停显示具体 token 和占比。
 - 按模型：展示当前筛选范围内各模型占比。
 - 按服务器：展示当前筛选范围内各上报服务器占比。
@@ -156,6 +165,21 @@ OpenClaw 只统计 `model.completed` 事件，并跳过重复的 `trace.artifact
 - 公网部署建议放在 HTTPS 反向代理、Tailscale、SSH 隧道或内网环境后面。
 - `TOKENMETER_TOKEN` 请使用足够长的随机字符串。
 - 一键安装脚本会把 token 写入本机服务环境文件；这些文件只留在被安装的机器上，不会提交到仓库。
+
+## GitHub 使用
+
+推荐直接从 GitHub 安装稳定分支：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh | sudo sh -s -- server
+```
+
+如果你 fork 了本仓库，可以通过 `TOKENMETER_REPO` 和 `TOKENMETER_REF` 指定自己的仓库和分支：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dake2482/tokenmeter/main/scripts/install.sh \
+  | sudo env TOKENMETER_REPO="your-name/tokenmeter" TOKENMETER_REF="main" sh -s -- server
+```
 
 ## 开发与测试
 
